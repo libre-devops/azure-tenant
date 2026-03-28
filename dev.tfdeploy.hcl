@@ -12,26 +12,6 @@ identity_token "azurerm" {
   audience = ["api://AzureADTokenExchange"]
 }
 
-locals {
-  environment = {
-    name         = "dev"
-    auto_approve = true
-  }
-}
-
-deployment_auto_approve "dev_auto_approve" {
-  check {
-    condition = local.environment.name == "dev" && local.environment.auto_approve
-    reason    = "Always auto approve in dev."
-  }
-}
-
-deployment_group "dev_group" {
-  auto_approve_checks = [
-    deployment_auto_approve.dev_auto_approve
-  ]
-}
-
 deployment "dev" {
   inputs = {
     identity_token = identity_token.azurerm.jwt
