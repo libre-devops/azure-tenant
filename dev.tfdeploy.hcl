@@ -14,7 +14,7 @@ identity_token "azurerm" {
 
 deployment_auto_approve "dev_auto_approve" {
   check {
-    condition = deployment.dev.inputs.env == "dev"
+    condition = store.varset.shared_env.env == "dev"
     reason    = "Always auto approve in dev."
   }
 }
@@ -29,7 +29,6 @@ deployment "dev" {
   inputs = {
     identity_token = identity_token.azurerm.jwt
     env            = "dev"
-    long           = "libre-devops"
     short          = "libd"
     short_region   = "uks"
 

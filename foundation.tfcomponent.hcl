@@ -13,7 +13,6 @@ component "foundation" {
     layer_name   = "foundation"
     env          = var.env
     short        = var.short
-    long         = var.long
     short_region = var.short_region
   }
 }

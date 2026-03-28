@@ -8,8 +8,6 @@ variable "short_region" {
   description = "Short Azure region code. e.g. uks, ukw, euw."
 }
 
-
-
 variable "tenant_id" {
   type        = string
   description = "Azure tenant ID (GUID)."
