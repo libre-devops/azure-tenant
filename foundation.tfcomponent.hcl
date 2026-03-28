@@ -15,6 +15,5 @@ component "foundation" {
     short        = var.short
     long         = var.long
     short_region = var.short_region
-    long_region  = var.long_region
   }
 }

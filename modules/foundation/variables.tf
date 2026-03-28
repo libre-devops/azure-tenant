@@ -9,17 +9,6 @@ variable "env" {
   }
 }
 
-variable "long_region" {
-  type        = string
-  description = "Long code for Azure region. Allowed values: uksouth, ukwest, westeurope."
-  nullable    = false
-
-  validation {
-    condition     = contains(["uksouth", "ukwesty", "westeurope"], lower(trimspace(var.long_region)))
-    error_message = "lonh_region must be one of: uksouth, ukwest, westeurope (case-insensitive)."
-  }
-}
-
 variable "short" {
   type        = string
   description = "Short resource prefix used in naming (lowercase letters/numbers/hyphens)."
@@ -39,5 +28,16 @@ variable "short_region" {
   validation {
     condition     = contains(["uks", "ukw", "euw"], lower(trimspace(var.short_region)))
     error_message = "short_region must be one of: uks, ukw, euw (case-insensitive)."
+  }
+}
+
+variable "layer_name" {
+  type        = string
+  description = "Platform layer identifier for this run. Allowed values: foundation, networking, automation-standard, automation-privileged, alerting, sentinel, integration (case-insensitive)."
+  nullable    = false
+
+  validation {
+    condition     = contains(["foundation"], lower(trimspace(var.layer_name)))
+    error_message = "layer_name must be one of: foundation, automation, integration (case-insensitive)."
   }
 }

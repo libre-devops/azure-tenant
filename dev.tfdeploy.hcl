@@ -32,7 +32,6 @@ deployment "dev" {
     long           = "libre-devops"
     short          = "libd"
     short_region   = "uks"
-    long_region    = "uksouth"
 
     subscription_id = store.varset.shared.subscription_id
     tenant_id       = store.varset.shared.tenant_id
