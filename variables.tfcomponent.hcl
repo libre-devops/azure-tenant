@@ -12,12 +12,14 @@ variable "tenant_id" {
   type        = string
   description = "Azure tenant ID (GUID)."
   ephemeral   = true
+  sensitive   = true
 }
 
 variable "subscription_id" {
   type        = string
   description = "Azure subscription ID (GUID)."
   ephemeral   = true
+  sensitive   = true
 }
 
 variable "short" {
@@ -29,12 +31,14 @@ variable "rbac_client_id" {
   type        = string
   description = "Client ID for the RBAC Service Principal used by the azurerm.rbac provider alias."
   ephemeral   = true
+  sensitive   = true
 }
 
 variable "write_client_id" {
   type        = string
   description = "Client ID for the write Service Principal used by the azurerm provider"
   ephemeral   = true
+  sensitive   = true
 }
 
 variable "identity_token" {
