@@ -6,7 +6,7 @@ terraform {
       version               = "~> 4.64.0"
     }
     azapi = {
-      configuration_aliases = [azurerm.rbac]
+      configuration_aliases = [azapi.rbac]
       source                = "Azure/azapi"
       version               = "~> 2.8.0"
     }

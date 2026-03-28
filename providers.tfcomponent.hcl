@@ -49,7 +49,6 @@ provider "azurerm" "rbac" {
 
 provider "azapi" "write" {
   config {
-    storage_use_azuread = true
     use_oidc            = true
     use_cli             = false
 
@@ -62,7 +61,6 @@ provider "azapi" "write" {
 
 provider "azapi" "rbac" {
   config {
-    storage_use_azuread = true
     use_oidc            = true
     use_cli             = false
 

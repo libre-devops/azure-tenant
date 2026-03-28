@@ -14,8 +14,8 @@ identity_token "azurerm" {
 
 deployment_auto_approve "dev_auto_approve" {
   check {
-    condition = true
-    reason    = "Always auto approve in dev"
+    condition = deployment.dev.inputs.env == "dev"
+    reason    = "Always auto approve in dev."
   }
 }
 
