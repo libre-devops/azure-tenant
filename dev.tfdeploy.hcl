@@ -12,9 +12,16 @@ identity_token "azurerm" {
   audience = ["api://AzureADTokenExchange"]
 }
 
+locals {
+  environment = {
+    name         = "dev"
+    auto_approve = true
+  }
+}
+
 deployment_auto_approve "dev_auto_approve" {
   check {
-    condition = store.varset.shared_env.env == "dev"
+    condition = local.environment.name == "dev" && local.environment.auto_approve
     reason    = "Always auto approve in dev."
   }
 }
