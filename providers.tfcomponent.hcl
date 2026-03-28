@@ -1,0 +1,74 @@
+required_providers {
+  azurerm = {
+    source  = "hashicorp/azurerm"
+    version = "~> 4.64.0"
+  }
+  azapi = {
+    source  = "Azure/azapi"
+    version = "~> 2.9.0"
+  }
+}
+
+provider "azurerm" "write" {
+  config {
+    features {
+      resource_group {
+        prevent_deletion_if_contains_resources = false
+      }
+    }
+
+    storage_use_azuread = true
+    use_oidc            = true
+    use_cli             = false
+
+    subscription_id = var.subscription_id
+    tenant_id       = var.tenant_id
+    client_id       = var.write_client_id
+    oidc_token      = var.identity_token
+  }
+}
+
+provider "azurerm" "rbac" {
+  config {
+    features {
+      resource_group {
+        prevent_deletion_if_contains_resources = false
+      }
+    }
+
+    storage_use_azuread = true
+    use_oidc            = true
+    use_cli             = false
+
+    subscription_id = var.subscription_id
+    tenant_id       = var.tenant_id
+    client_id       = var.rbac_client_id
+    oidc_token      = var.identity_token
+  }
+}
+
+provider "azapi" "write" {
+  config {
+    storage_use_azuread = true
+    use_oidc            = true
+    use_cli             = false
+
+    subscription_id = var.subscription_id
+    tenant_id       = var.tenant_id
+    client_id       = var.write_client_id
+    oidc_token      = var.identity_token
+  }
+}
+
+provider "azapi" "rbac" {
+  config {
+    storage_use_azuread = true
+    use_oidc            = true
+    use_cli             = false
+
+    subscription_id = var.subscription_id
+    tenant_id       = var.tenant_id
+    client_id       = var.rbac_client_id
+    oidc_token      = var.identity_token
+  }
+}
