@@ -194,7 +194,7 @@ resource "azurerm_automation_runbook" "runbook_mde_sync" {
   content = file("${path.module}/Sync-MDELinuxDeviceToEntra.ps1")
 }
 
-resource "azurerm_automation_job_schedule" "runbook_schedule_debug" {
+resource "azurerm_automation_job_schedule" "runbook_schedule_mde_sync" {
   resource_group_name = module.shared_vars.foundation_rg_name
 
   automation_account_name = module.automation_account.aa_name
