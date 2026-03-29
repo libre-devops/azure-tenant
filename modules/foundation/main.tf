@@ -142,7 +142,7 @@ resource "azurerm_automation_schedule" "every_60_min" {
   name                    = module.shared_vars.foundation_aa_every_60_min_schedule_name
 
   frequency = "Hour"
-  interval  = 30
+  interval  = 1
   timezone  = "UTC"
 }
 
