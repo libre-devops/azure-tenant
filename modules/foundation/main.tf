@@ -148,7 +148,8 @@ resource "azurerm_automation_job_schedule" "runbook_schedule" {
   runbook_name  = azurerm_automation_runbook.debug_runbook.name
   schedule_name = azurerm_automation_schedule.every_60_min_debug.name
 
+  #Due to a bug in the implementation of Runbooks in Azure, the parameter names need to be specified in lowercase only. See: "https://github.com/Azure/azure-sdk-for-go/issues/4780" for more information
   parameters = {
-    ManagedIdentityClientId = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
+    managedidentityclientid = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
   }
 }

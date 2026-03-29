@@ -1,7 +1,7 @@
 [CmdletBiding()]
 param (
     [Parameter(Mandatory)]
-    [string] $ManagedIdentityClientId
+    [string] $managedidentityclientid
 )
 
 
@@ -34,7 +34,7 @@ function Write-Log {
 # CONFIG
 # ============================================================
 
-$ManagedIdentityClientId = $ManagedIdentityClientId
+$ManagedIdentityClientId = $managedidentityclientid
 
 # ============================================================
 # AUTH (USER-ASSIGNED MI)
