@@ -7,7 +7,7 @@ locals {
   foundation_rg_name                       = "${local.rg_prefix}-${local.base_name}-${local.normalised_layer}"
   foundation_uid_name                      = "${local.user_assigned_managed_identity_prefix}-${local.base_name}-${local.normalised_layer}"
   foundation_aa_name                       = "${local.automation_account_prefix}-${local.base_name}-${local.normalised_layer}"
-  foundation_debug_automation_runbook_name  = "${local.automation_account_runbook_prefix}-${local.base_name}-${local.normalised_layer}-debug"
+  foundation_debug_automation_runbook_name = "${local.automation_account_runbook_prefix}-${local.base_name}-${local.normalised_layer}-debug"
   foundation_aa_every_60_min_schedule_name = "Every-60-Minutes"
 }
 

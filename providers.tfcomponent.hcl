@@ -57,8 +57,8 @@ provider "azurerm" "rbac" {
 
 provider "azapi" "write" {
   config {
-    use_oidc            = true
-    use_cli             = false
+    use_oidc = true
+    use_cli  = false
 
     subscription_id = var.subscription_id
     tenant_id       = var.tenant_id
@@ -69,8 +69,8 @@ provider "azapi" "write" {
 
 provider "azapi" "rbac" {
   config {
-    use_oidc            = true
-    use_cli             = false
+    use_oidc = true
+    use_cli  = false
 
     subscription_id = var.subscription_id
     tenant_id       = var.tenant_id
@@ -81,23 +81,23 @@ provider "azapi" "rbac" {
 
 provider "azuread" "this" {
   config {
-    use_oidc            = true
-    use_cli             = false
+    use_oidc = true
+    use_cli  = false
 
-    tenant_id       = var.tenant_id
-    client_id       = var.rbac_client_id
-    oidc_token      = var.identity_token
+    tenant_id  = var.tenant_id
+    client_id  = var.rbac_client_id
+    oidc_token = var.identity_token
   }
 }
 
 provider "msgraph" "this" {
   config {
-    use_oidc            = true
-    use_cli             = false
-    use_powershell      = false
+    use_oidc       = true
+    use_cli        = false
+    use_powershell = false
 
-    tenant_id       = var.tenant_id
-    client_id       = var.rbac_client_id
-    oidc_token      = var.identity_token
+    tenant_id  = var.tenant_id
+    client_id  = var.rbac_client_id
+    oidc_token = var.identity_token
   }
 }

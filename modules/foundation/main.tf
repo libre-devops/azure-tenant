@@ -122,9 +122,9 @@ resource "azurerm_automation_runbook" "debug_runbook" {
 
   runbook_type             = "PowerShell"
   runtime_environment_name = azurerm_automation_runtime_environment.ps72.name
-  log_verbose  = true
-  log_progress = true
-  description  = "Test stuff"
+  log_verbose              = true
+  log_progress             = true
+  description              = "Test stuff"
 
   content = file("${path.module}/Debug.ps1")
 }
