@@ -10,6 +10,14 @@ terraform {
       source                = "Azure/azapi"
       version               = "~> 2.8.0"
     }
+    azuread = {
+      source  = "hashicorp/azuread"
+      version = "~> 3.8.0"
+    }
+    msgraph = {
+      source  = "microsoft/msgraph"
+      version = "~> 0.3.0"
+    }
   }
 }
 

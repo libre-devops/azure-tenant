@@ -7,6 +7,14 @@ required_providers {
     source  = "Azure/azapi"
     version = "~> 2.9.0"
   }
+  azuread = {
+    source  = "hashicorp/azuread"
+    version = "~> 3.8.0"
+  }
+  msgraph = {
+    source  = "microsoft/msgraph"
+    version = "~> 0.3.0"
+  }
 }
 
 provider "azurerm" "write" {
@@ -65,6 +73,29 @@ provider "azapi" "rbac" {
     use_cli             = false
 
     subscription_id = var.subscription_id
+    tenant_id       = var.tenant_id
+    client_id       = var.rbac_client_id
+    oidc_token      = var.identity_token
+  }
+}
+
+provider "azuread" "this" {
+  config {
+    use_oidc            = true
+    use_cli             = false
+
+    tenant_id       = var.tenant_id
+    client_id       = var.rbac_client_id
+    oidc_token      = var.identity_token
+  }
+}
+
+provider "msgraph" "this" {
+  config {
+    use_oidc            = true
+    use_cli             = false
+    use_powershell      = false
+
     tenant_id       = var.tenant_id
     client_id       = var.rbac_client_id
     oidc_token      = var.identity_token

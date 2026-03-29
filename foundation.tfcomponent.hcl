@@ -6,6 +6,8 @@ component "foundation" {
     azurerm.rbac = provider.azurerm.rbac
     azapi        = provider.azapi.write
     azapi.rbac   = provider.azapi.rbac
+    azuread      = provider.azuread.this
+    msgraph      = provider.msgraph.this
   }
 
 
