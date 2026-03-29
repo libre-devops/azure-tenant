@@ -210,7 +210,7 @@ resource "azurerm_automation_job_schedule" "runbook_schedule_mde_sync" {
 
 resource "azurerm_monitor_action_group" "mde_sync_alerts" {
   name                = "ag-mde-sync-alerts"
-  resource_group_name = module.shared_vars.foundation_rg_name
+  resource_group_name = module.rg.rg_name
   short_name          = "mde-sync"
 
   email_receiver {
