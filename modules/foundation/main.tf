@@ -89,6 +89,19 @@ resource "azuread_app_role_assignment" "defender_machine_read" {
   ])
 }
 
+resource "azurerm_automation_runtime_environment" "ps72" {
+  automation_account_id = module.automation_account.aa_id
+  location              = module.rg.rg_location
+  tags                  = module.shared_vars.tags
+
+
+  name             = "ps72-runtime"
+  runtime_language = "PowerShell"
+  runtime_version  = "7.2"
+
+  description = "PowerShell 7.2 runtime "
+}
+
 resource "azurerm_automation_runbook" "test_runbook" {
   resource_group_name = module.rg.rg_name
   location            = module.rg.rg_location
@@ -97,10 +110,12 @@ resource "azurerm_automation_runbook" "test_runbook" {
   automation_account_name = module.automation_account.aa_name
   name                    = module.shared_vars.foundation_test_automation_runbook_name
 
-  runbook_type = "PowerShell72"
+  runbook_type             = "PowerShell"
+  runtime_environment_name = azurerm_automation_runtime_environment.ps72.name
   log_verbose  = true
   log_progress = true
   description  = "Test stuff"
+
 
   content = <<-EOF
     $ErrorActionPreference = 'Stop'
