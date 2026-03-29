@@ -54,7 +54,6 @@ data "azuread_service_principal" "defender" {
 }
 
 data "azuread_service_principal" "mi" {
-
   depends_on = [module.automation_account]
 
   display_name = module.shared_vars.foundation_uid_name
@@ -90,12 +89,10 @@ resource "azuread_app_role_assignment" "defender_machine_read" {
   ])
 }
 
-
 resource "azurerm_automation_runbook" "test_runbook" {
-
-  resource_group_name     = module.rg.rg_name
-  location                = module.rg.rg_location
-  tags                    = module.rg.rg_tags
+  resource_group_name = module.rg.rg_name
+  location            = module.rg.rg_location
+  tags                = module.rg.rg_tags
 
   automation_account_name = module.automation_account.aa_name
   name                    = module.shared_vars.foundation_test_automation_runbook_name
@@ -138,22 +135,22 @@ resource "azurerm_automation_runbook" "test_runbook" {
   EOF
 }
 
-resource "azurerm_automation_schedule" "every_30_min" {
-  resource_group_name     = module.shared_vars.foundation_rg_name
+resource "azurerm_automation_schedule" "every_60_min" {
+  resource_group_name = module.shared_vars.foundation_rg_name
 
   automation_account_name = module.automation_account.aa_name
-  name                    = module.shared_vars.foundation_aa_every_30_min_schedule_name
+  name                    = module.shared_vars.foundation_aa_every_60_min_schedule_name
 
-  frequency = "Minute"
+  frequency = ""
   interval  = 30
   timezone  = "UTC"
 }
 
 resource "azurerm_automation_job_schedule" "runbook_schedule" {
-  resource_group_name     = module.shared_vars.foundation_rg_name
+  resource_group_name = module.shared_vars.foundation_rg_name
 
   automation_account_name = module.automation_account.aa_name
 
-  runbook_name = azurerm_automation_runbook.test_runbook.name
-  schedule_name = azurerm_automation_schedule.every_30_min.name
+  runbook_name  = azurerm_automation_runbook.test_runbook.name
+  schedule_name = azurerm_automation_schedule.every_60_min.name
 }
