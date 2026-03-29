@@ -56,36 +56,36 @@ data "azuread_service_principal" "defender" {
 data "azuread_service_principal" "mi" {
 
   depends_on = [module.automation_account]
-  
+
   display_name = module.shared_vars.foundation_uid_name
 }
 
-# resource "azuread_app_role_assignment" "graph_device_read" {
-#   principal_object_id = data.azuread_service_principal.mi.object_id
-#   resource_object_id  = data.azuread_service_principal.graph.object_id
-#
-#   app_role_id = one([
-#     for role in data.azuread_service_principal.graph.app_roles :
-#     role.id if role.value == "Device.Read.All"
-#   ])
-# }
-#
-# resource "azuread_app_role_assignment" "graph_group_rw" {
-#   principal_object_id = data.azuread_service_principal.mi.object_id
-#   resource_object_id  = data.azuread_service_principal.graph.object_id
-#
-#   app_role_id = one([
-#     for role in data.azuread_service_principal.graph.app_roles :
-#     role.id if role.value == "GroupMember.ReadWrite.All"
-#   ])
-# }
-#
-# resource "azuread_app_role_assignment" "defender_machine_read" {
-#   principal_object_id = data.azuread_service_principal.mi.object_id
-#   resource_object_id  = data.azuread_service_principal.defender.object_id
-#
-#   app_role_id = one([
-#     for role in data.azuread_service_principal.defender.app_roles :
-#     role.id if role.value == "Machine.Read.All"
-#   ])
-# }
+resource "azuread_app_role_assignment" "graph_device_read" {
+  principal_object_id = data.azuread_service_principal.mi.object_id
+  resource_object_id  = data.azuread_service_principal.graph.object_id
+
+  app_role_id = one([
+    for role in data.azuread_service_principal.graph.app_roles :
+    role.id if role.value == "Device.Read.All"
+  ])
+}
+
+resource "azuread_app_role_assignment" "graph_group_rw" {
+  principal_object_id = data.azuread_service_principal.mi.object_id
+  resource_object_id  = data.azuread_service_principal.graph.object_id
+
+  app_role_id = one([
+    for role in data.azuread_service_principal.graph.app_roles :
+    role.id if role.value == "GroupMember.ReadWrite.All"
+  ])
+}
+
+resource "azuread_app_role_assignment" "defender_machine_read" {
+  principal_object_id = data.azuread_service_principal.mi.object_id
+  resource_object_id  = data.azuread_service_principal.defender.object_id
+
+  app_role_id = one([
+    for role in data.azuread_service_principal.defender.app_roles :
+    role.id if role.value == "Machine.Read.All"
+  ])
+}
