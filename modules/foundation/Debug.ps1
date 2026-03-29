@@ -1,4 +1,3 @@
-[CmdletBiding()]
 param (
     [Parameter(Mandatory)]
     [string] $managedidentityclientid
