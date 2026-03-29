@@ -89,7 +89,7 @@ resource "azuread_app_role_assignment" "defender_machine_read" {
   ])
 }
 
-resource "azurerm_automation_runtime_environment" "ps72" {
+resource "azurerm_automation_runtime_environment" "ps72_debug" {
   automation_account_id = module.automation_account.aa_id
   location              = module.rg.rg_location
 
@@ -112,7 +112,7 @@ resource "azurerm_automation_runtime_environment" "ps72" {
   description = "Debug runtime for PowerShell 7.2"
 }
 
-resource "azurerm_automation_runbook" "debug_runbook" {
+resource "azurerm_automation_runbook" "runbook_debug" {
   resource_group_name = module.rg.rg_name
   location            = module.rg.rg_location
   tags                = module.rg.rg_tags
@@ -121,7 +121,7 @@ resource "azurerm_automation_runbook" "debug_runbook" {
   name                    = module.shared_vars.foundation_debug_automation_runbook_name
 
   runbook_type             = "PowerShell"
-  runtime_environment_name = azurerm_automation_runtime_environment.ps72.name
+  runtime_environment_name = azurerm_automation_runtime_environment.ps72_debug.name
   log_verbose              = true
   log_progress             = true
   description              = "Test stuff"
@@ -129,7 +129,7 @@ resource "azurerm_automation_runbook" "debug_runbook" {
   content = file("${path.module}/Debug.ps1")
 }
 
-resource "azurerm_automation_schedule" "every_60_min_debug" {
+resource "azurerm_automation_schedule" "every_60_min" {
   resource_group_name = module.shared_vars.foundation_rg_name
 
   automation_account_name = module.automation_account.aa_name
@@ -140,13 +140,67 @@ resource "azurerm_automation_schedule" "every_60_min_debug" {
   timezone  = "Etc/UTC"
 }
 
-resource "azurerm_automation_job_schedule" "runbook_schedule" {
+resource "azurerm_automation_job_schedule" "runbook_schedule_debug" {
   resource_group_name = module.shared_vars.foundation_rg_name
 
   automation_account_name = module.automation_account.aa_name
 
-  runbook_name  = azurerm_automation_runbook.debug_runbook.name
-  schedule_name = azurerm_automation_schedule.every_60_min_debug.name
+  runbook_name  = azurerm_automation_runbook.runbook_debug.name
+  schedule_name = azurerm_automation_schedule.every_60_min.name
+
+  #Due to a bug in the implementation of Runbooks in Azure, the parameter names need to be specified in lowercase only. See: "https://github.com/Azure/azure-sdk-for-go/issues/4780" for more information
+  parameters = {
+    managedidentityclientid = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
+  }
+}
+
+resource "azurerm_automation_runtime_environment" "ps72_mde_sync" {
+  automation_account_id = module.automation_account.aa_id
+  location              = module.rg.rg_location
+
+  #Only 3 tags are allowed
+  tags = {
+    ContactEmail   = lookup(module.shared_vars.tags, "ContactEmail", null)
+    Classification = lookup(module.shared_vars.tags, "Classification", null)
+    CostCenter     = lookup(module.shared_vars.tags, "CostCenter", null)
+  }
+
+
+  name             = "MDE-Sync-Pwsh72-Runtime"
+  runtime_language = "PowerShell"
+  runtime_version  = "7.2"
+
+  runtime_default_packages = {
+    "az" = "11.2.0"
+  }
+
+  description = "MDE Sync runtime for PowerShell 7.2"
+}
+
+resource "azurerm_automation_runbook" "runbook_mde_sync" {
+  resource_group_name = module.rg.rg_name
+  location            = module.rg.rg_location
+  tags                = module.rg.rg_tags
+
+  automation_account_name = module.automation_account.aa_name
+  name                    = module.shared_vars.foundation_mde_sync_automation_runbook_name
+
+  runbook_type             = "PowerShell"
+  runtime_environment_name = azurerm_automation_runtime_environment.ps72_mde_sync.name
+  log_verbose              = true
+  log_progress             = true
+  description              = "Sync MDE devices to Entra Group"
+
+  content = file("${path.module}/Sync-MDELinuxDeviceToEntra.ps1")
+}
+
+resource "azurerm_automation_job_schedule" "runbook_schedule_debug" {
+  resource_group_name = module.shared_vars.foundation_rg_name
+
+  automation_account_name = module.automation_account.aa_name
+
+  runbook_name  = azurerm_automation_runbook.runbook_mde_sync.name
+  schedule_name = azurerm_automation_schedule.every_60_min.name
 
   #Due to a bug in the implementation of Runbooks in Azure, the parameter names need to be specified in lowercase only. See: "https://github.com/Azure/azure-sdk-for-go/issues/4780" for more information
   parameters = {

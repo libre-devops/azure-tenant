@@ -1,14 +1,15 @@
 locals {
-  rg_prefix                                = "rg"
-  user_assigned_managed_identity_prefix    = "uid"
-  automation_account_prefix                = "aa"
-  automation_account_runbook_prefix        = "aarb"
-  base_name                                = "${local.normalised_short}-${local.validated_env}"
-  foundation_rg_name                       = "${local.rg_prefix}-${local.base_name}-${local.normalised_layer}"
-  foundation_uid_name                      = "${local.user_assigned_managed_identity_prefix}-${local.base_name}-${local.normalised_layer}"
-  foundation_aa_name                       = "${local.automation_account_prefix}-${local.base_name}-${local.normalised_layer}"
-  foundation_debug_automation_runbook_name = "${local.automation_account_runbook_prefix}-${local.base_name}-${local.normalised_layer}-debug"
-  foundation_aa_every_60_min_schedule_name = "Every-60-Minutes"
+  rg_prefix                                   = "rg"
+  user_assigned_managed_identity_prefix       = "uid"
+  automation_account_prefix                   = "aa"
+  automation_account_runbook_prefix           = "aarb"
+  base_name                                   = "${local.normalised_short}-${local.validated_env}"
+  foundation_rg_name                          = "${local.rg_prefix}-${local.base_name}-${local.normalised_layer}"
+  foundation_uid_name                         = "${local.user_assigned_managed_identity_prefix}-${local.base_name}-${local.normalised_layer}"
+  foundation_aa_name                          = "${local.automation_account_prefix}-${local.base_name}-${local.normalised_layer}"
+  foundation_debug_automation_runbook_name    = "${local.automation_account_runbook_prefix}-${local.base_name}-${local.normalised_layer}-debug"
+  foundation_mde_sync_automation_runbook_name = "${local.automation_account_runbook_prefix}-${local.base_name}-${local.normalised_layer}-mde-sync"
+  foundation_aa_every_60_min_schedule_name    = "Every-60-Minutes"
 }
 
 output "base_name" {
@@ -34,6 +35,11 @@ output "foundation_aa_name" {
 output "foundation_debug_automation_runbook_name" {
   description = "Deterministic name for foundation runbook name"
   value       = local.foundation_debug_automation_runbook_name
+}
+
+output "foundation_mde_sync_automation_runbook_name" {
+  description = "Deterministic name for foundation mde sync runbook name"
+  value       = local.foundation_mde_sync_automation_runbook_name
 }
 
 output "foundation_aa_every_60_min_schedule_name" {
