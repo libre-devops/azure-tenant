@@ -127,12 +127,6 @@ resource "azurerm_automation_runbook" "debug_runbook" {
   description  = "Test stuff"
 
   content = file("${path.module}/Debug.ps1")
-
-  lifecycle {
-    replace_triggered_by = [
-      filesha256("${path.module}/Debug.ps1")
-    ]
-  }
 }
 
 resource "azurerm_automation_schedule" "every_60_min_debug" {
