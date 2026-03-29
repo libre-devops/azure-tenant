@@ -92,14 +92,20 @@ resource "azuread_app_role_assignment" "defender_machine_read" {
 resource "azurerm_automation_runtime_environment" "ps72" {
   automation_account_id = module.automation_account.aa_id
   location              = module.rg.rg_location
-  tags                  = module.shared_vars.tags
+
+  #Only 3 tags are allowed
+  tags = {
+    ContactEmail   = lookup(module.shared_vars.tags, "ContactEmail", null)
+    Classification = lookup(module.shared_vars.tags, "Classification", null)
+    CostCenter     = lookup(module.shared_vars.tags, "CostCenter", null)
+  }
 
 
   name             = "ps72-runtime"
   runtime_language = "PowerShell"
   runtime_version  = "7.2"
 
-  description = "PowerShell 7.2 runtime "
+  description = "PowerShell 7.2 runtime"
 }
 
 resource "azurerm_automation_runbook" "test_runbook" {
