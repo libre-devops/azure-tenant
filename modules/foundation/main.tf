@@ -97,7 +97,7 @@ resource "azurerm_automation_runbook" "test_runbook" {
   automation_account_name = module.automation_account.aa_name
   name                    = module.shared_vars.foundation_test_automation_runbook_name
 
-  runbook_type = "PowerShell"
+  runbook_type = "PowerShell72"
   log_verbose  = true
   log_progress = true
   description  = "Test stuff"
@@ -143,7 +143,7 @@ resource "azurerm_automation_schedule" "every_60_min" {
 
   frequency = "Hour"
   interval  = 1
-  timezone  = "UTC"
+  timezone  = "Etc/UTC"
 }
 
 resource "azurerm_automation_job_schedule" "runbook_schedule" {
