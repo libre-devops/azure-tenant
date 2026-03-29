@@ -207,3 +207,56 @@ resource "azurerm_automation_job_schedule" "runbook_schedule_mde_sync" {
     managedidentityclientid = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
   }
 }
+
+resource "azurerm_monitor_action_group" "mde_sync_alerts" {
+  name                = "ag-mde-sync-alerts"
+  resource_group_name = module.shared_vars.foundation_rg_name
+  short_name          = "mde-sync"
+
+  email_receiver {
+    name                    = "craig-email"
+    email_address           = "craig@craigthacker.dev"
+    use_common_alert_schema = true
+  }
+}
+
+resource "azurerm_monitor_metric_alert" "mde_sync_failed_jobs" {
+  resource_group_name = module.rg.rg_name
+  tags                = module.rg.rg_tags
+
+  name = "alert-mde-sync-failed-jobs"
+
+  scopes = [
+    module.automation_account.aa_id
+  ]
+
+  description = "Alert when Sync-MdeDevicesToEntraGroup runbook has failed jobs"
+
+  severity    = 2
+  frequency   = "PT5M"
+  window_size = "PT5M"
+
+  criteria {
+    metric_namespace = "Microsoft.Automation/automationAccounts"
+    metric_name      = "TotalJobs"
+    aggregation      = "Total"
+    operator         = "GreaterThanOrEqual"
+    threshold        = 1
+
+    dimension {
+      name     = "RunbookName"
+      operator = "Include"
+      values   = ["Sync-MdeDevicesToEntraGroup"]
+    }
+
+    dimension {
+      name     = "Status"
+      operator = "Include"
+      values   = ["Failed"]
+    }
+  }
+
+  action {
+    action_group_id = azurerm_monitor_action_group.mde_sync_alerts.id
+  }
+}
