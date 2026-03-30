@@ -94,6 +94,20 @@
     │ (graph.microsoft.com)                            │                                  │ displayName                                          │
     │                                                  │ GroupMember.ReadWrite.All        │ Read, add and remove group members                   │
     └──────────────────────────────────────────────────┴──────────────────────────────────┴──────────────────────────────────────────────────────┘
+
+    ─────────────────────────────────────────────────────────────────────────────
+    FAILURE ALERTING (Option 1 — native Azure Monitor metric alert)
+    ─────────────────────────────────────────────────────────────────────────────
+
+    Resource   : Your Automation Account
+    Signal     : TotalJob (metric)
+    Filter     : RunbookName = Sync-MdeDevicesToEntraGroup, Status = Failed
+    Threshold  : Count >= 1
+    Action     : Action Group → email / Teams webhook / SMS
+
+    Catches both hard crashes and runs that completed with genuine API errors.
+    Resolution-pending devices (eventual consistency) do NOT trigger this alert.
+    ─────────────────────────────────────────────────────────────────────────────
 #>
 
 [CmdletBinding()]
@@ -277,7 +291,14 @@ function Invoke-WithRetry
         {
             $msg = $_.Exception.Message
 
-            $retryAfter = $_.Exception.Response?.Headers?['Retry-After']
+            # Safely extract Retry-After — plain exceptions (e.g. System.Exception thrown in tests
+            # or non-HTTP errors) do not have a Response property. Under Set-StrictMode -Version Latest
+            # accessing a missing property throws, so we guard with PSObject.Properties first.
+            $retryAfter = $null
+            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response)
+            {
+                $retryAfter = $_.Exception.Response.Headers?['Retry-After']
+            }
             if ($retryAfter -is [array])
             {
                 $retryAfter = $retryAfter[0]
