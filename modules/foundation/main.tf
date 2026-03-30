@@ -244,7 +244,7 @@ resource "azurerm_monitor_metric_alert" "mde_sync_failed_jobs" {
     threshold        = 1
 
     dimension {
-      name     = "RunbookName"
+      name     = "Runbook"
       operator = "Include"
       values   = ["Sync-MdeDevicesToEntraGroup"]
     }
