@@ -102,12 +102,11 @@ param (
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Script-scoped error counter — incremented on every non-fatal error.
-# Read at the very end to decide whether to surface a job failure to Azure Monitor.
-$script:SyncErrorCount = 0
+$script:SoftErrorCount = 0   # Expected (eventual consistency)
+$script:HardErrorCount = 0   # Real failures
 
 # ============================================================
-#  LOGGER
+# LOGGER
 # ============================================================
 
 function Log-Message
@@ -140,24 +139,14 @@ function Log-Message
 }
 
 # ============================================================
-#  AUTH (USER-ASSIGNED MANAGED IDENTITY)
+# AUTH
 # ============================================================
 
 function Initialize-ManagedIdentityAuth
 {
-    <#
-    .SYNOPSIS
-        Establishes an Az module context for the specified User-Assigned Managed Identity.
-        Must be called before Get-AccessToken.
-    #>
     try
     {
-        Log-Message -Level INFO `
-                    -Message "Authenticating via User-Assigned Managed Identity..." `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
-        Log-Message -Level DEBUG `
-                    -Message "ClientId: $ManagedIdentityClientId" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+        Log-Message INFO "Authenticating via User-Assigned Managed Identity..." $MyInvocation.MyCommand.Name
 
         Disable-AzContextAutosave -Scope Process -ErrorAction SilentlyContinue | Out-Null
 
@@ -166,74 +155,41 @@ function Initialize-ManagedIdentityAuth
             -AccountId  $ManagedIdentityClientId `
             -ErrorAction Stop | Out-Null
 
-        Log-Message -Level INFO `
-                    -Message "Managed Identity authentication successful." `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+        Log-Message INFO "Managed Identity authentication successful." $MyInvocation.MyCommand.Name
     }
     catch
     {
-        Log-Message -Level ERROR `
-                    -Message "Authentication FAILED: $( $_.Exception.Message )" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+        Log-Message ERROR "Authentication FAILED: $( $_.Exception.Message )" $MyInvocation.MyCommand.Name
         throw
     }
 }
 
 function Get-AccessToken
 {
-    <#
-    .SYNOPSIS
-        Returns a plain-string bearer token for the given resource using the Az context
-        established by Initialize-ManagedIdentityAuth.
-
-    .NOTES
-        Get-AzAccessToken returns a PSAccessToken whose .Token property is a plain
-        System.String at Az 11.2.0. It is cast explicitly to [string] to guarantee a
-        clean scalar — this prevents edge cases where PowerShell returns an Object[]
-        that interpolates as garbage inside the Authorization header.
-
-        Never call Write-Output (or anything that writes to the output stream) inside
-        this function — doing so concatenates log lines onto the return value.
-    #>
-    param (
-        [Parameter(Mandatory)]
-        [string] $Resource
-    )
+    param ([Parameter(Mandatory)][string] $Resource)
 
     try
     {
-        Log-Message -Level INFO `
-                    -Message "Requesting token for: $Resource" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+        Log-Message DEBUG "Requesting token for $Resource" $MyInvocation.MyCommand.Name
 
-        $tokenResponse = Get-AzAccessToken `
-            -ResourceUrl $Resource `
-            -ErrorAction Stop
+        $tokenResponse = Get-AzAccessToken -ResourceUrl $Resource -ErrorAction Stop
 
         if (-not $tokenResponse.Token)
         {
-            throw "Token extraction failed — response contained no token."
+            throw "Token extraction failed"
         }
 
-        $token = [string]$tokenResponse.Token
-
-        Log-Message -Level DEBUG `
-                    -Message "Token acquired (type: $( $tokenResponse.Token.GetType().Name ), length: $( $token.Length ))" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
-
-        return $token
+        return [string]$tokenResponse.Token
     }
     catch
     {
-        Log-Message -Level ERROR `
-                    -Message "Failed to acquire token for $Resource : $( $_.Exception.Message )" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+        Log-Message ERROR "Token failure for ${Resource}: $( $_.Exception.Message )" $MyInvocation.MyCommand.Name
         throw
     }
 }
 
 # ============================================================
-#  RETRY (429-aware)
+# RETRY
 # ============================================================
 
 function Invoke-WithRetry
@@ -243,7 +199,8 @@ function Invoke-WithRetry
         [string]      $OperationName = 'Operation'
     )
 
-    for ($i = 1; $i -le $MaxRetries; $i++) {
+    for ($i = 1; $i -le $MaxRetries; $i++)
+    {
         try
         {
             return & $ScriptBlock
@@ -252,38 +209,20 @@ function Invoke-WithRetry
         {
             $msg = $_.Exception.Message
 
-            $retryAfter = $_.Exception.Response?.Headers?['Retry-After']
-            if ($retryAfter -is [array])
-            {
-                $retryAfter = $retryAfter[0]
-            }
-            $delay = if ($retryAfter -and ($retryAfter -as [int]))
-            {
-                [int]$retryAfter
-            }
-            else
-            {
-                $RetryDelaySeconds
-            }
-
             if ($i -eq $MaxRetries)
             {
-                Log-Message -Level ERROR `
-                            -Message "FAILED after $MaxRetries attempts: $OperationName | $msg" `
-                            -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                Log-Message ERROR "FAILED after $MaxRetries attempts: $OperationName | $msg" $MyInvocation.MyCommand.Name
                 throw
             }
 
-            Log-Message -Level WARN `
-                        -Message "Retry $i/$MaxRetries for '$OperationName' | waiting ${delay}s | $msg" `
-                        -InvocationName "$( $MyInvocation.MyCommand.Name )"
-            Start-Sleep -Seconds $delay
+            Log-Message WARN "Retry $i/$MaxRetries for '$OperationName'" $MyInvocation.MyCommand.Name
+            Start-Sleep -Seconds $RetryDelaySeconds
         }
     }
 }
 
 # ============================================================
-#  MDE
+# MDE
 # ============================================================
 
 function Get-MdeDevicesByTag
@@ -291,126 +230,72 @@ function Get-MdeDevicesByTag
     param (
         [string[]] $Tags,
         [string]   $Token,
-
-    # OS filter (server-side)
-        [string[]] $OsPlatforms = @(
-        "RedHatEnterpriseLinux",
-        "Ubuntu",
-        "CentOS"
-    ),
-
-    # Health filter (server-side, future-proof)
-        [string[]] $HealthStatus = @(
-        "Active"
-    )
+        [string[]] $OsPlatforms,
+        [string[]] $HealthStatus
     )
 
-    Log-Message -Level INFO `
-                -Message "Querying MDE (OS + health filtered, tag client-side). Tags: '$( $Tags -join "', '" )' | OS: '$( $OsPlatforms -join "', '" )' | Health: '$( $HealthStatus -join "', '" )'" `
-                -InvocationName "$( $MyInvocation.MyCommand.Name )"
+    Log-Message INFO "Querying MDE (OS + health filtered)" $MyInvocation.MyCommand.Name
 
-    # Lookup sets
     $tagSet = [System.Collections.Generic.HashSet[string]]::new()
     $osSet = [System.Collections.Generic.HashSet[string]]::new()
     $healthSet = [System.Collections.Generic.HashSet[string]]::new()
 
-    foreach ($t in $Tags)
-    {
-        [void]$tagSet.Add($t)
-    }
-    foreach ($o in $OsPlatforms)
-    {
-        [void]$osSet.Add($o)
-    }
-    foreach ($h in $HealthStatus)
-    {
-        [void]$healthSet.Add($h)
-    }
+    $Tags | ForEach-Object { [void]$tagSet.Add($_) }
+    $OsPlatforms | ForEach-Object { [void]$osSet.Add($_) }
+    $HealthStatus | ForEach-Object { [void]$healthSet.Add($_) }
 
     $seen = [System.Collections.Generic.HashSet[string]]::new()
     $all = [System.Collections.Generic.List[pscustomobject]]::new()
 
-    # Build OData filters
-    $osFilter = ($OsPlatforms  | ForEach-Object { "osPlatform eq '$_'" }) -join " or "
-    $healthFilter = ($HealthStatus | ForEach-Object { "healthStatus eq '$_'" }) -join " or "
-
-    $combinedFilter = "($osFilter) and ($healthFilter)"
-
-    $uri = "https://api.securitycenter.microsoft.com/api/machines?`$filter=$combinedFilter"
+    $uri = "https://api.securitycenter.microsoft.com/api/machines"
 
     do
     {
-        $res = Invoke-WithRetry -OperationName "MDE OS+Health query" -ScriptBlock {
+        $res = Invoke-WithRetry -OperationName "MDE query" -ScriptBlock {
             Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $Token" }
         }
 
-        if ($res.value)
+        foreach ($device in $res.value)
         {
-            foreach ($device in $res.value)
+            if (-not $device.machineTags)
             {
+                continue
+            }
+            if (-not $osSet.Contains($device.osPlatform))
+            {
+                continue
+            }
+            if (-not $healthSet.Contains($device.healthStatus))
+            {
+                continue
+            }
 
-                # Defensive checks (protect against API quirks)
-                if (-not $device.osPlatform -or -not $osSet.Contains($device.osPlatform))
+            $match = $false
+            foreach ($tag in $device.machineTags)
+            {
+                if ( $tagSet.Contains($tag))
                 {
-                    continue
+                    $match = $true; break
                 }
-                if (-not $device.healthStatus -or -not $healthSet.Contains($device.healthStatus))
-                {
-                    continue
-                }
+            }
 
-                if (-not $device.machineTags)
-                {
-                    continue
-                }
-
-                # Tag match (client-side)
-                $match = $false
-                foreach ($tag in $device.machineTags)
-                {
-                    if ( $tagSet.Contains($tag))
-                    {
-                        $match = $true
-                        break
-                    }
-                }
-
-                if ($match)
-                {
-                    if ( $seen.Add($device.id))
-                    {
-                        $all.Add($device)
-                    }
-                    else
-                    {
-                        Log-Message -Level DEBUG `
-                                    -Message "Skipping duplicate device '$( $device.computerDnsName )'." `
-                                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
-                    }
-                }
+            if ($match -and $seen.Add($device.id))
+            {
+                $all.Add($device)
             }
         }
 
-        if ($res.PSObject.Properties.Name -contains '@odata.nextLink')
-        {
-            $uri = $res.'@odata.nextLink'
-        }
-        else
-        {
-            $uri = $null
-        }
+        $uri = $res.'@odata.nextLink'
+    }
+    while ($uri)
 
-    } while ($uri)
-
-    Log-Message -Level INFO `
-                -Message "Matched $( $all.Count ) device(s) after filtering." `
-                -InvocationName "$( $MyInvocation.MyCommand.Name )"
+    Log-Message INFO "Matched $( $all.Count ) device(s)" $MyInvocation.MyCommand.Name
 
     return $all.ToArray()
 }
 
 # ============================================================
-#  RESOLUTION
+# RESOLUTION
 # ============================================================
 
 function Resolve-EntraDeviceId
@@ -420,133 +305,79 @@ function Resolve-EntraDeviceId
     $name = $Device.computerDnsName
     $shortName = $name.Split('.')[0]
 
-    # ============================================================
-    # 1. FAST PATH — aadDeviceId
-    # ============================================================
-
+    # FAST PATH
     if ($Device.aadDeviceId)
     {
         try
         {
-            $res = Invoke-WithRetry -OperationName "Resolve aadDeviceId ($name)" -ScriptBlock {
+            $res = Invoke-WithRetry -OperationName "aadDeviceId lookup ($name)" -ScriptBlock {
                 Invoke-RestMethod `
-                    -Uri     "https://graph.microsoft.com/v1.0/devices?`$filter=deviceId eq '$( $Device.aadDeviceId )'&`$select=id" `
+                    -Uri "https://graph.microsoft.com/v1.0/devices?`$filter=deviceId eq '$( $Device.aadDeviceId )'&`$select=id" `
                     -Headers @{ Authorization = "Bearer $GraphToken" }
             }
 
             if ($res.value)
             {
-                Log-Message -Level DEBUG `
-                    -Message "Resolved via aadDeviceId: '$name'" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
-
+                Write-Verbose "SUCCESS: aadDeviceId resolved $name"
                 return $res.value[0].id
             }
         }
         catch
         {
-            Log-Message -Level WARN `
-                -Message "aadDeviceId lookup failed for '$name': $( $_.Exception.Message )" `
-                -InvocationName "$( $MyInvocation.MyCommand.Name )"
+            Log-Message WARN "aadDeviceId lookup failed for '$name'" $MyInvocation.MyCommand.Name
         }
     }
 
-    # ============================================================
-    # 2. GRAPH-FIRST EXACT MATCH (PRIMARY PATH)
-    # ============================================================
-
-    Log-Message -Level WARN `
-        -Message "Attempting Graph resolution for '$name'." `
-        -InvocationName "$( $MyInvocation.MyCommand.Name )"
-
+    # EXACT MATCH
     try
     {
         $filter = "displayName eq '$name' or displayName eq '$shortName'"
 
-        $res = Invoke-WithRetry -OperationName "Graph exact match ($name)" -ScriptBlock {
+        $res = Invoke-WithRetry -OperationName "Exact match ($name)" -ScriptBlock {
             Invoke-RestMethod `
-                -Uri     "https://graph.microsoft.com/v1.0/devices?`$filter=$filter&`$select=id,displayName,trustType" `
+                -Uri "https://graph.microsoft.com/v1.0/devices?`$filter=$filter&`$select=id,displayName,trustType" `
                 -Headers @{ Authorization = "Bearer $GraphToken" }
         }
 
         if ($res.value)
         {
-            $match = $res.value |
-                    Where-Object { -not $_.trustType } |
-                    Select-Object -First 1
-
-            if (-not $match)
-            {
-                $match = $res.value | Select-Object -First 1
-            }
-
-            Log-Message -Level DEBUG `
-                -Message "Resolved via exact match: '$name' → '$($match.displayName)' ($($match.id))" `
-                -InvocationName "$( $MyInvocation.MyCommand.Name )"
-
-            return $match.id
+            Write-Verbose "SUCCESS: exact match resolved $name"
+            return $res.value[0].id
         }
     }
     catch
     {
-        Log-Message -Level WARN `
-            -Message "Exact match lookup failed for '$name': $( $_.Exception.Message )" `
-            -InvocationName "$( $MyInvocation.MyCommand.Name )"
+        Log-Message WARN "Exact match failed for '$name'" $MyInvocation.MyCommand.Name
     }
 
-    # ============================================================
-    # 3. FUZZY MATCH (STARTSWITH)
-    # ============================================================
-
+    # FUZZY
     try
     {
-        Log-Message -Level WARN `
-            -Message "Falling back to fuzzy match for '$name'." `
-            -InvocationName "$( $MyInvocation.MyCommand.Name )"
-
-        $res = Invoke-WithRetry -OperationName "Graph fuzzy match ($name)" -ScriptBlock {
+        $res = Invoke-WithRetry -OperationName "Fuzzy match ($name)" -ScriptBlock {
             Invoke-RestMethod `
-                -Uri     "https://graph.microsoft.com/v1.0/devices?`$filter=startswith(displayName,'$shortName')&`$select=id,displayName,trustType" `
+                -Uri "https://graph.microsoft.com/v1.0/devices?`$filter=startswith(displayName,'$shortName')" `
                 -Headers @{ Authorization = "Bearer $GraphToken" }
         }
 
         if ($res.value)
         {
-            $match = $res.value |
-                    Where-Object { -not $_.trustType } |
-                    Select-Object -First 1
-
-            if (-not $match)
-            {
-                $match = $res.value | Select-Object -First 1
-            }
-
-            Log-Message -Level DEBUG `
-                -Message "Resolved via fuzzy match: '$name' → '$($match.displayName)' ($($match.id))" `
-                -InvocationName "$( $MyInvocation.MyCommand.Name )"
-
-            return $match.id
+            Write-Verbose "SUCCESS: fuzzy match resolved $name"
+            return $res.value[0].id
         }
     }
     catch
     {
-        Log-Message -Level ERROR `
-            -Message "Fuzzy match failed for '$name': $( $_.Exception.Message )" `
-            -InvocationName "$( $MyInvocation.MyCommand.Name )"
+        Log-Message WARN "Fuzzy match failed for '$name'" $MyInvocation.MyCommand.Name
     }
 
-    # ============================================================
-    # 4. FINAL FAILURE
-    # ============================================================
-
-    Log-Message -Level ERROR `
-        -Message "Failed to resolve Entra device for '$name'." `
-        -InvocationName "$( $MyInvocation.MyCommand.Name )"
+    $script:SoftErrorCount++
+    Log-Message WARN "Unresolved device (likely eventual consistency): '$name'" $MyInvocation.MyCommand.Name
 
     return $null
 }
+
 # ============================================================
-#  GROUP OPS
+# GROUP OPS (UPDATED)
 # ============================================================
 
 function Add-DeviceToGroup
@@ -570,17 +401,24 @@ function Add-DeviceToGroup
                 -Headers @{ Authorization = "Bearer $Token"; 'Content-Type' = 'application/json' } `
                 -Body    (@{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$DeviceId" } | ConvertTo-Json)
         }
+
+        Write-Verbose "SUCCESS: Added device $DeviceId to group $GroupId"
     }
     catch
     {
         if ($_.Exception.Message -match 'already exist')
         {
             Log-Message -Level DEBUG `
-                        -Message "Device $DeviceId already a member (race condition — safe to ignore)." `
+                        -Message "Device $DeviceId already a member (safe)." `
                         -InvocationName "$( $MyInvocation.MyCommand.Name )"
             return
         }
-        throw
+
+        # ❌ HARD FAILURE
+        $script:HardErrorCount++
+        Log-Message -Level ERROR `
+                    -Message "Failed to add device $DeviceId : $( $_.Exception.Message )" `
+                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
     }
 }
 
@@ -604,22 +442,29 @@ function Remove-DeviceFromGroup
                 -Uri     "https://graph.microsoft.com/v1.0/groups/$GroupId/members/$DeviceId/`$ref" `
                 -Headers @{ Authorization = "Bearer $Token" }
         }
+
+        Write-Verbose "SUCCESS: Removed device $DeviceId from group $GroupId"
     }
     catch
     {
         if ($_.Exception.Message -match 'does not exist')
         {
             Log-Message -Level DEBUG `
-                        -Message "Device $DeviceId already removed (safe to ignore)." `
+                        -Message "Device $DeviceId already removed (safe)." `
                         -InvocationName "$( $MyInvocation.MyCommand.Name )"
             return
         }
-        throw
+
+        # ❌ HARD FAILURE
+        $script:HardErrorCount++
+        Log-Message -Level ERROR `
+                    -Message "Failed to remove device $DeviceId : $( $_.Exception.Message )" `
+                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
     }
 }
 
 # ============================================================
-#  SUMMARY REPORT
+# SUMMARY REPORT
 # ============================================================
 
 function Write-SyncSummary
@@ -630,7 +475,8 @@ function Write-SyncSummary
         [object[]] $CurrentMembers,
         [object[]] $AddedDevices,
         [object[]] $RemovedDevices,
-        [int]      $ErrorCount
+        [int]      $SoftErrors,
+        [int]      $HardErrors
     )
 
     $sep = '=' * 72
@@ -646,8 +492,12 @@ function Write-SyncSummary
     Write-Host "  WhatIf Mode     : $WhatIf"
     Write-Host ''
 
+    # -------------------------------
+    # Current members
+    # -------------------------------
     Write-Host "  ALL CURRENT GROUP MEMBERS ($( $CurrentMembers.Count ))" -ForegroundColor Yellow
     Write-Host "  $( '-' * 68 )"
+
     if ($CurrentMembers.Count -eq 0)
     {
         Write-Host '    (none)' -ForegroundColor DarkGray
@@ -660,12 +510,16 @@ function Write-SyncSummary
         }
     }
 
+    # -------------------------------
+    # Added
+    # -------------------------------
     Write-Host ''
     Write-Host "  ADDED THIS RUN ($( $AddedDevices.Count ))" -ForegroundColor Green
     Write-Host "  $( '-' * 68 )"
+
     if ($AddedDevices.Count -eq 0)
     {
-        Write-Host '    (none — all tagged devices were already members)' -ForegroundColor DarkGray
+        Write-Host '    (none — already in desired state)' -ForegroundColor DarkGray
     }
     else
     {
@@ -675,9 +529,13 @@ function Write-SyncSummary
         }
     }
 
+    # -------------------------------
+    # Removed
+    # -------------------------------
     Write-Host ''
     Write-Host "  REMOVED THIS RUN ($( $RemovedDevices.Count ))" -ForegroundColor Magenta
     Write-Host "  $( '-' * 68 )"
+
     if ($RemovedDevices.Count -eq 0)
     {
         Write-Host '    (none)' -ForegroundColor DarkGray
@@ -690,8 +548,12 @@ function Write-SyncSummary
         }
     }
 
+    # -------------------------------
+    # Errors (NEW SPLIT)
+    # -------------------------------
     Write-Host ''
-    Write-Host "  NON-FATAL ERRORS : $ErrorCount" -ForegroundColor $( if ($ErrorCount -gt 0)
+    Write-Host "  SOFT ERRORS (expected) : $SoftErrors" -ForegroundColor Yellow
+    Write-Host "  HARD ERRORS (real)     : $HardErrors" -ForegroundColor $( if ($HardErrors -gt 0)
     {
         'Red'
     }
@@ -699,14 +561,16 @@ function Write-SyncSummary
     {
         'DarkGray'
     } )
+
     Write-Host ''
     Write-Host $sep -ForegroundColor Cyan
     Write-Host ''
 }
 
 # ============================================================
-#  MAIN
+# MAIN
 # ============================================================
+
 Log-Message -Level INFO `
     -Message "========== Sync started | Tags: '$( $DeviceTag -join "', '" )' | OS: '$( $OsPlatforms -join "', '" )' | Health: '$( $HealthStatus -join "', '" )' | Group: '$EntraGroupObjectId' | RemoveStale: $RemoveStaleMembers | WhatIf: $WhatIf ==========" `
     -InvocationName 'MAIN'
@@ -715,53 +579,55 @@ Log-Message -Level INFO `
 $addedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
 $removedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
 
-# --- Auth ---
+# ============================================================
+# AUTH
+# ============================================================
+
 Initialize-ManagedIdentityAuth
 
-# --- Tokens ---
+# ============================================================
+# TOKENS
+# ============================================================
+
 $graphToken = Get-AccessToken -Resource 'https://graph.microsoft.com'
 $mdeToken = Get-AccessToken -Resource 'https://api.securitycenter.microsoft.com'
 
-# --- MDE devices ---
+# ============================================================
+# MDE DEVICES
+# ============================================================
+
 $mdeDevices = Get-MdeDevicesByTag `
     -Tags $DeviceTag `
     -Token $mdeToken `
     -OsPlatforms $OsPlatforms `
     -HealthStatus $HealthStatus
 
-# --- Early exit if MDE returned no devices ---
-# Auth succeeded and the API responded cleanly — there are simply no devices carrying
-# any of the specified tags yet. Exit with Completed status rather than failing the job.
+# ============================================================
+# EARLY EXIT
+# ============================================================
+
 if (@($mdeDevices).Count -eq 0)
 {
     Log-Message -Level WARN `
-                -Message "MDE returned 0 devices for tag(s): '$( $DeviceTag -join "', '" )'. Auth is working. Nothing to sync." `
-                -InvocationName 'MAIN'
+        -Message "MDE returned 0 devices. Nothing to sync." `
+        -InvocationName 'MAIN'
 
-    $sep = '=' * 72
-    Write-Host ''
-    Write-Host $sep                                           -ForegroundColor Cyan
-    Write-Host '  SYNC SUMMARY REPORT'                       -ForegroundColor Cyan
-    Write-Host "  $( Get-Date -Format 'yyyy-MM-dd HH:mm:ss' )" -ForegroundColor Cyan
-    Write-Host $sep                                           -ForegroundColor Cyan
-    Write-Host ''
-    Write-Host "  Group Object ID  : $EntraGroupObjectId"
-    Write-Host "  MDE Device Tag(s): $( $DeviceTag -join ', ' )"
-    Write-Host "  WhatIf Mode      : $WhatIf"
-    Write-Host ''
-    Write-Host '  AUTH             : OK'                                          -ForegroundColor Green
-    Write-Host '  MDE DEVICES FOUND: 0 — no devices carry this tag yet.'         -ForegroundColor Yellow
-    Write-Host '  MEMBERS ADDED    : 0'
-    Write-Host '  MEMBERS REMOVED  : 0'
-    Write-Host '  NON-FATAL ERRORS : 0'                                           -ForegroundColor DarkGray
-    Write-Host ''
-    Write-Host $sep -ForegroundColor Cyan
-    Write-Host ''
+    Write-SyncSummary `
+        -GroupObjectId  $EntraGroupObjectId `
+        -DeviceTag      $DeviceTag `
+        -CurrentMembers @() `
+        -AddedDevices   @() `
+        -RemovedDevices @() `
+        -SoftErrors     0 `
+        -HardErrors     0
 
     exit 0
 }
 
-# --- Resolve Entra Object IDs ---
+# ============================================================
+# RESOLVE ENTRA IDs
+# ============================================================
+
 $resolved = [System.Collections.Generic.List[pscustomobject]]::new()
 
 foreach ($d in $mdeDevices)
@@ -774,20 +640,24 @@ foreach ($d in $mdeDevices)
             Id = $id
             DisplayName = $d.computerDnsName
         })
+
+        Write-Verbose "SUCCESS: Resolved $( $d.computerDnsName )"
     }
     else
     {
-        $script:SyncErrorCount++
-        Log-Message -Level ERROR `
-                    -Message "Could not resolve Entra ID for '$( $d.computerDnsName )'. Device skipped." `
-                    -InvocationName 'MAIN'
+        # ❗ NO HARD FAILURE HERE
+        # Already counted as SoftError inside resolver
+        Write-Verbose "SKIPPED: $( $d.computerDnsName ) (unresolved)"
     }
 }
 
-# --- Current group members (snapshot before changes) ---
+# ============================================================
+# CURRENT GROUP MEMBERS
+# ============================================================
+
 $currentRaw = Invoke-WithRetry -OperationName 'Get current group members' -ScriptBlock {
     Invoke-RestMethod `
-        -Uri     "https://graph.microsoft.com/v1.0/groups/$EntraGroupObjectId/members?`$select=id,displayName" `
+        -Uri "https://graph.microsoft.com/v1.0/groups/$EntraGroupObjectId/members?`$select=id,displayName" `
         -Headers @{ Authorization = "Bearer $graphToken" }
 }
 
@@ -804,9 +674,13 @@ $currentMembers = @($currentRaw.value) | ForEach-Object {
         }
     }
 }
+
 $currentIds = @($currentMembers | Select-Object -ExpandProperty Id)
 
-# --- Add missing devices ---
+# ============================================================
+# ADD DEVICES
+# ============================================================
+
 foreach ($device in $resolved)
 {
     if ($currentIds -notcontains $device.Id)
@@ -814,28 +688,34 @@ foreach ($device in $resolved)
         try
         {
             Add-DeviceToGroup -GroupId $EntraGroupObjectId -DeviceId $device.Id -Token $graphToken
+
             $addedDevices.Add($device)
+
             Log-Message -Level INFO `
-                        -Message "Added '$( $device.DisplayName )' ($( $device.Id ))." `
-                        -InvocationName 'MAIN'
+                -Message "Added '$( $device.DisplayName )' ($( $device.Id ))" `
+                -InvocationName 'MAIN'
         }
         catch
         {
-            $script:SyncErrorCount++
+            $script:HardErrorCount++
+
             Log-Message -Level ERROR `
-                        -Message "Failed to add '$( $device.DisplayName )' ($( $device.Id )): $( $_.Exception.Message )" `
-                        -InvocationName 'MAIN'
+                -Message "Failed to add '$( $device.DisplayName )': $( $_.Exception.Message )" `
+                -InvocationName 'MAIN'
         }
     }
     else
     {
         Log-Message -Level DEBUG `
-                    -Message "'$( $device.DisplayName )' already in group. Skipping." `
-                    -InvocationName 'MAIN'
+            -Message "'$( $device.DisplayName )' already in group" `
+            -InvocationName 'MAIN'
     }
 }
 
-# --- Remove stale members ---
+# ============================================================
+# REMOVE STALE
+# ============================================================
+
 if ($RemoveStaleMembers)
 {
     $resolvedIds = $resolved | Select-Object -ExpandProperty Id
@@ -847,26 +727,32 @@ if ($RemoveStaleMembers)
             try
             {
                 Remove-DeviceFromGroup -GroupId $EntraGroupObjectId -DeviceId $member.Id -Token $graphToken
+
                 $removedDevices.Add($member)
+
                 Log-Message -Level INFO `
-                            -Message "Removed stale '$( $member.DisplayName )' ($( $member.Id ))." `
-                            -InvocationName 'MAIN'
+                    -Message "Removed stale '$( $member.DisplayName )'" `
+                    -InvocationName 'MAIN'
             }
             catch
             {
-                $script:SyncErrorCount++
+                $script:HardErrorCount++
+
                 Log-Message -Level ERROR `
-                            -Message "Failed to remove '$( $member.DisplayName )' ($( $member.Id )): $( $_.Exception.Message )" `
-                            -InvocationName 'MAIN'
+                    -Message "Failed to remove '$( $member.DisplayName )': $( $_.Exception.Message )" `
+                    -InvocationName 'MAIN'
             }
         }
     }
 }
 
-# --- Final member list (post-change) ---
+# ============================================================
+# FINAL MEMBERS SNAPSHOT
+# ============================================================
+
 $finalRaw = Invoke-WithRetry -OperationName 'Get final group members' -ScriptBlock {
     Invoke-RestMethod `
-        -Uri     "https://graph.microsoft.com/v1.0/groups/$EntraGroupObjectId/members?`$select=id,displayName" `
+        -Uri "https://graph.microsoft.com/v1.0/groups/$EntraGroupObjectId/members?`$select=id,displayName" `
         -Headers @{ Authorization = "Bearer $graphToken" }
 }
 
@@ -884,9 +770,13 @@ $finalMembers = @($finalRaw.value) | ForEach-Object {
     }
 }
 
+# ============================================================
+# FINAL LOG + SUMMARY
+# ============================================================
+
 Log-Message -Level INFO `
-            -Message "========== Sync complete | Added: $( $addedDevices.Count ) | Removed: $( $removedDevices.Count ) | Errors: $script:SyncErrorCount ==========" `
-            -InvocationName 'MAIN'
+    -Message "========== Sync complete | Added: $( $addedDevices.Count ) | Removed: $( $removedDevices.Count ) | SoftErrors: $script:SoftErrorCount | HardErrors: $script:HardErrorCount ==========" `
+    -InvocationName 'MAIN'
 
 Write-SyncSummary `
     -GroupObjectId  $EntraGroupObjectId `
@@ -894,13 +784,14 @@ Write-SyncSummary `
     -CurrentMembers @($finalMembers) `
     -AddedDevices   @($addedDevices) `
     -RemovedDevices @($removedDevices) `
-    -ErrorCount     $script:SyncErrorCount
+    -SoftErrors     $script:SoftErrorCount `
+    -HardErrors     $script:HardErrorCount
 
-# ── Option 1 failure alerting ────────────────────────────────────────────────
-# Deliberately fail the job after the summary if any non-fatal errors occurred.
-# This causes the Azure Automation 'Total Jobs / Failed' metric to increment,
-# triggering the Azure Monitor alert rule without needing Application Insights.
-if ($script:SyncErrorCount -gt 0)
+# ============================================================
+# FINAL FAILURE LOGIC
+# ============================================================
+
+if ($script:HardErrorCount -gt 0)
 {
-    throw "Sync finished with $script:SyncErrorCount non-fatal error(s). Review job output above."
+    throw "Sync failed with $script:HardErrorCount real error(s). Review logs."
 }
