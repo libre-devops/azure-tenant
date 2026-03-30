@@ -238,7 +238,7 @@ resource "azurerm_monitor_metric_alert" "mde_sync_failed_jobs" {
 
   criteria {
     metric_namespace = "Microsoft.Automation/automationAccounts"
-    metric_name      = "TotalJobs"
+    metric_name      = "TotalJob"
     aggregation      = "Total"
     operator         = "GreaterThanOrEqual"
     threshold        = 1
