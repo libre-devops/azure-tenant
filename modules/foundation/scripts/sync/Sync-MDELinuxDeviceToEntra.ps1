@@ -54,6 +54,12 @@
     If $true, devices currently in the group that no longer match any tag are removed.
     Defaults to $false (additive-only).
 
+.PARAMETER ForceRemoveDeviceIds
+    One or more Entra ID Object IDs to explicitly remove from the group, regardless of
+    tag state. Use this when MDE API lag prevents automatic stale removal of offboarded
+    devices. If a supplied ID is not in the group, a 'nothing to do' message is logged
+    and no error is raised.
+
 .PARAMETER MaxRetries
     Maximum number of retry attempts for transient API failures. Default: 6.
 
@@ -88,20 +94,6 @@
     │ (graph.microsoft.com)                            │                                  │ displayName                                          │
     │                                                  │ GroupMember.ReadWrite.All        │ Read, add and remove group members                   │
     └──────────────────────────────────────────────────┴──────────────────────────────────┴──────────────────────────────────────────────────────┘
-
-    ─────────────────────────────────────────────────────────────────────────────
-    FAILURE ALERTING (Option 1 — native Azure Monitor metric alert)
-    ─────────────────────────────────────────────────────────────────────────────
-
-    Resource   : Your Automation Account
-    Signal     : Total Jobs (metric)
-    Filter     : RunbookName = Sync-MdeDevicesToEntraGroup, Status = Failed
-    Threshold  : Count >= 1
-    Action     : Action Group → email / Teams webhook / SMS
-
-    Catches both hard crashes and runs that completed with genuine API errors.
-    Resolution-pending devices (eventual consistency) do NOT trigger this alert.
-    ─────────────────────────────────────────────────────────────────────────────
 #>
 
 [CmdletBinding()]
@@ -114,6 +106,9 @@ param (
     [string] $EntraGroupObjectId = '853451d5-e186-4362-9337-6f8ce967570a',
 
     [bool] $RemoveStaleMembers = $false,
+
+    [string[]] $ForceRemoveDeviceIds = @(),
+
     [int]  $MaxRetries = 6,
     [int]  $RetryDelaySeconds = 20,
     [bool] $WhatIf = $false,
@@ -160,17 +155,17 @@ function Log-Message
         # Write-Verbose: operational detail, safe inside functions that return values.
         # Write-Output must NEVER be used — it corrupts return values (tokens, IDs).
         'DEBUG' {
-            Write-Verbose  "$prefix $Message"
+            Write-Verbose "$prefix $Message"
         }
         'INFO'  {
-            Write-Verbose  "$prefix $Message"
+            Write-Verbose "$prefix $Message"
         }
         # Write-Warning and Write-Host go to separate streams, safe anywhere.
         'WARN'  {
-            Write-Warning  "$prefix $Message"
+            Write-Warning "$prefix $Message"
         }
         'ERROR' {
-            Write-Host     "$prefix $Message" -ForegroundColor Red
+            Write-Host   "$prefix $Message" -ForegroundColor Red
         }
     }
 }
@@ -335,10 +330,13 @@ function Get-MdeDevicesByTag
     $seen = [System.Collections.Generic.HashSet[string]]::new()
     $all = [System.Collections.Generic.List[pscustomobject]]::new()
 
-    # Server-side filter on OS and health to reduce payload size
+    # Server-side filter on OS, health, and exclusion status to reduce payload size.
+    # isExcluded eq false ensures offboarded/inactive devices are excluded from results —
+    # MDE does not promptly remove offboarded devices from the API but does stamp them
+    # with isExcluded: true, which is the reliable signal for "no longer managed".
     $osFilter = ($OsPlatforms  | ForEach-Object { "osPlatform eq '$_'" }) -join ' or '
     $healthFilter = ($HealthStatus | ForEach-Object { "healthStatus eq '$_'" }) -join ' or '
-    $uri = "https://api.securitycenter.microsoft.com/api/machines?`$filter=($osFilter) and ($healthFilter)"
+    $uri = "https://api.securitycenter.microsoft.com/api/machines?`$filter=($osFilter) and ($healthFilter) and isExcluded eq false"
 
     do
     {
@@ -364,7 +362,7 @@ function Get-MdeDevicesByTag
                     continue
                 }
 
-                # Tag match (client-side — device must carry at least one of the requested tags)
+                # Tag match — device must carry at least one of the requested tags
                 $matched = $false
                 foreach ($tag in $device.machineTags)
                 {
@@ -402,7 +400,7 @@ function Get-MdeDevicesByTag
     } while ($uri)
 
     Log-Message -Level INFO `
-                -Message "Matched $( $all.Count ) device(s) after tag + OS + health filtering." `
+                -Message "Matched $( $all.Count ) device(s) after tag + OS + health + exclusion filtering." `
                 -InvocationName "$( $MyInvocation.MyCommand.Name )"
 
     return $all.ToArray()
@@ -732,12 +730,12 @@ function Write-SyncSummary
 # ============================================================
 
 Log-Message -Level INFO `
-            -Message "========== Sync started | Tags: '$( $DeviceTag -join "', '" )' | OS: '$( $OsPlatforms -join "', '" )' | Group: '$EntraGroupObjectId' | RemoveStale: $RemoveStaleMembers | WhatIf: $WhatIf ==========" `
+            -Message "========== Sync started | Tags: '$( $DeviceTag -join "', '" )' | OS: '$( $OsPlatforms -join "', '" )' | Group: '$EntraGroupObjectId' | RemoveStale: $RemoveStaleMembers | ForceRemove: $( $ForceRemoveDeviceIds.Count ) ID(s) | WhatIf: $WhatIf ==========" `
             -InvocationName 'MAIN'
 
 $addedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
 $removedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
-$pendingDevices = [System.Collections.Generic.List[string]]::new()   # just names, for the summary
+$pendingDevices = [System.Collections.Generic.List[string]]::new()
 
 # --- Auth ---
 Initialize-ManagedIdentityAuth
@@ -748,13 +746,38 @@ $mdeToken = Get-AccessToken -Resource 'https://api.securitycenter.microsoft.com'
 
 # --- MDE devices ---
 $mdeDevices = Get-MdeDevicesByTag `
-    -Tags        $DeviceTag `
-    -Token       $mdeToken `
-    -OsPlatforms $OsPlatforms `
+    -Tags         $DeviceTag `
+    -Token        $mdeToken `
+    -OsPlatforms  $OsPlatforms `
     -HealthStatus $HealthStatus
 
+# --- Current group members (needed by both normal sync and force-remove) ---
+$currentRaw = Invoke-WithRetry -OperationName 'Get current group members' -ScriptBlock {
+    Invoke-RestMethod `
+        -Uri     "https://graph.microsoft.com/v1.0/groups/$EntraGroupObjectId/members?`$select=id,displayName" `
+        -Headers @{ Authorization = "Bearer $graphToken" }
+}
+
+$currentMembers = @($currentRaw.value) | ForEach-Object {
+    [pscustomobject]@{
+        Id = $_.id
+        DisplayName = if ($_.displayName)
+        {
+            $_.displayName
+        }
+        else
+        {
+            '(unknown)'
+        }
+    }
+}
+$currentIds = @($currentMembers | Select-Object -ExpandProperty Id)
+
 # --- Early exit if MDE returned no devices ---
-if (@($mdeDevices).Count -eq 0)
+# Only exit early if RemoveStaleMembers is false and no ForceRemoveDeviceIds are supplied.
+# If RemoveStaleMembers is true, an empty MDE result is a valid desired state of
+# "nothing should be in the group" — stale removal must still run to honour that.
+if (@($mdeDevices).Count -eq 0 -and @($ForceRemoveDeviceIds).Count -eq 0 -and -not $RemoveStaleMembers)
 {
     Log-Message -Level WARN `
                 -Message "MDE returned 0 devices for tag(s): '$( $DeviceTag -join "', '" )'. Auth is working. Nothing to sync." `
@@ -771,12 +794,12 @@ if (@($mdeDevices).Count -eq 0)
     Write-Host "  MDE Tag(s)       : $( $DeviceTag -join ', ' )"
     Write-Host "  WhatIf Mode      : $WhatIf"
     Write-Host ''
-    Write-Host '  AUTH              : OK'                                       -ForegroundColor Green
-    Write-Host '  MDE DEVICES FOUND : 0 — no devices match the tag(s) and OS filter yet.' -ForegroundColor Yellow
+    Write-Host '  AUTH              : OK'                                                   -ForegroundColor Green
+    Write-Host '  MDE DEVICES FOUND : 0 — no devices match the tag(s) and OS filter yet.'  -ForegroundColor Yellow
     Write-Host '  MEMBERS ADDED     : 0'
     Write-Host '  MEMBERS REMOVED   : 0'
     Write-Host '  PENDING           : 0'
-    Write-Host '  API ERRORS        : 0'                                        -ForegroundColor DarkGray
+    Write-Host '  API ERRORS        : 0'                                                    -ForegroundColor DarkGray
     Write-Host ''
     Write-Host $sep -ForegroundColor Cyan
     Write-Host ''
@@ -784,7 +807,7 @@ if (@($mdeDevices).Count -eq 0)
     exit 0
 }
 
-# --- Resolve Entra Object IDs ---
+# --- Resolve Entra Object IDs for MDE devices ---
 $resolved = [System.Collections.Generic.List[pscustomobject]]::new()
 
 foreach ($d in $mdeDevices)
@@ -810,28 +833,6 @@ foreach ($d in $mdeDevices)
     }
 }
 
-# --- Current group members (snapshot before changes) ---
-$currentRaw = Invoke-WithRetry -OperationName 'Get current group members' -ScriptBlock {
-    Invoke-RestMethod `
-        -Uri     "https://graph.microsoft.com/v1.0/groups/$EntraGroupObjectId/members?`$select=id,displayName" `
-        -Headers @{ Authorization = "Bearer $graphToken" }
-}
-
-$currentMembers = @($currentRaw.value) | ForEach-Object {
-    [pscustomobject]@{
-        Id = $_.id
-        DisplayName = if ($_.displayName)
-        {
-            $_.displayName
-        }
-        else
-        {
-            '(unknown)'
-        }
-    }
-}
-$currentIds = @($currentMembers | Select-Object -ExpandProperty Id)
-
 # --- Add missing devices ---
 foreach ($device in $resolved)
 {
@@ -847,7 +848,6 @@ foreach ($device in $resolved)
         }
         catch
         {
-            # Genuine failure — API error after all retries exhausted
             $script:SyncErrorCount++
             Log-Message -Level ERROR `
                         -Message "Failed to add '$( $device.DisplayName )' ($( $device.Id )): $( $_.Exception.Message )" `
@@ -863,6 +863,9 @@ foreach ($device in $resolved)
 }
 
 # --- Remove stale members ---
+# A device is stale if it is in the group but no longer appears in the MDE query results.
+# The MDE query already excludes isExcluded devices, so offboarded devices naturally
+# fall out of $resolved and get removed here when RemoveStaleMembers is enabled.
 if ($RemoveStaleMembers)
 {
     $resolvedIds = @($resolved | Select-Object -ExpandProperty Id)
@@ -886,6 +889,47 @@ if ($RemoveStaleMembers)
                             -Message "Failed to remove '$( $member.DisplayName )' ($( $member.Id )): $( $_.Exception.Message )" `
                             -InvocationName 'MAIN'
             }
+        }
+    }
+}
+
+# --- Force remove (manual override) ---
+# Explicitly removes specific Entra device Object IDs regardless of tag or MDE state.
+# Use when MDE API lag prevents automatic stale removal of known-offboarded devices.
+# Uses the pre-change $currentIds snapshot — consistent with the rest of MAIN.
+if (@($ForceRemoveDeviceIds).Count -gt 0)
+{
+    Log-Message -Level INFO `
+                -Message "Force-remove override: $( $ForceRemoveDeviceIds.Count ) device ID(s) supplied." `
+                -InvocationName 'MAIN'
+
+    foreach ($forceId in $ForceRemoveDeviceIds)
+    {
+        if ($currentIds -notcontains $forceId)
+        {
+            Log-Message -Level INFO `
+                        -Message "Force-remove: '$forceId' is not in the group — nothing to do." `
+                        -InvocationName 'MAIN'
+            continue
+        }
+
+        try
+        {
+            Remove-DeviceFromGroup -GroupId $EntraGroupObjectId -DeviceId $forceId -Token $graphToken
+            $removedDevices.Add([pscustomobject]@{
+                Id = $forceId
+                DisplayName = "(force-removed)"
+            })
+            Log-Message -Level INFO `
+                        -Message "Force-remove: successfully removed '$forceId' from group." `
+                        -InvocationName 'MAIN'
+        }
+        catch
+        {
+            $script:SyncErrorCount++
+            Log-Message -Level ERROR `
+                        -Message "Force-remove: failed to remove '$forceId': $( $_.Exception.Message )" `
+                        -InvocationName 'MAIN'
         }
     }
 }

@@ -126,7 +126,7 @@ resource "azurerm_automation_runbook" "runbook_debug" {
   log_progress             = true
   description              = "Test stuff"
 
-  content = file("${path.module}/Debug.ps1")
+  content = file("${path.module}/scripts/debug/Debug.ps1")
 }
 
 resource "azurerm_automation_schedule" "every_60_min" {
@@ -191,7 +191,7 @@ resource "azurerm_automation_runbook" "runbook_mde_sync" {
   log_progress             = true
   description              = "Sync MDE devices to Entra Group"
 
-  content = file("${path.module}/Sync-MDELinuxDeviceToEntra.ps1")
+  content = file("${path.module}/scripts/sync/Sync-MDELinuxDeviceToEntra.ps1")
 }
 
 resource "azurerm_automation_job_schedule" "runbook_schedule_mde_sync" {
