@@ -94,20 +94,6 @@
     │ (graph.microsoft.com)                            │                                  │ displayName                                          │
     │                                                  │ GroupMember.ReadWrite.All        │ Read, add and remove group members                   │
     └──────────────────────────────────────────────────┴──────────────────────────────────┴──────────────────────────────────────────────────────┘
-
-    ─────────────────────────────────────────────────────────────────────────────
-    FAILURE ALERTING (Option 1 — native Azure Monitor metric alert)
-    ─────────────────────────────────────────────────────────────────────────────
-
-    Resource   : Your Automation Account
-    Signal     : TotalJob (metric)
-    Filter     : RunbookName = Sync-MdeDevicesToEntraGroup, Status = Failed
-    Threshold  : Count >= 1
-    Action     : Action Group → email / Teams webhook / SMS
-
-    Catches both hard crashes and runs that completed with genuine API errors.
-    Resolution-pending devices (eventual consistency) do NOT trigger this alert.
-    ─────────────────────────────────────────────────────────────────────────────
 #>
 
 [CmdletBinding()]
@@ -887,6 +873,8 @@ foreach ($device in $resolved)
 # A device is stale if it is in the group but no longer appears in the MDE query results.
 # The MDE query already excludes isExcluded devices, so offboarded devices naturally
 # fall out of $resolved and get removed here when RemoveStaleMembers is enabled.
+# Please note: The force removal basically isn't working at all, I have tried adding a top level try-catch and guarding the DeviceIds, but get exception errors.
+# Don't use the force device IDs method, just let InTune handle it, and if you must, use the non-forced IDs to try and reconcile, that code doesn't hit an exception
 if ($RemoveStaleMembers)
 {
     $resolvedIds = @($resolved | Select-Object -ExpandProperty Id)
