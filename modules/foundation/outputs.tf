@@ -18,14 +18,14 @@ output "rbac_tenant_id" {
   value       = data.azurerm_client_config.rbac.tenant_id
 }
 
-output "rg_location" {
-  description = "Resource group location."
-  value       = module.rg.rg_location
-}
-
 output "rg_id" {
   description = "Resource group ID."
   value       = module.rg.rg_id
+}
+
+output "rg_location" {
+  description = "Resource group location."
+  value       = module.rg.rg_location
 }
 
 output "rg_name" {

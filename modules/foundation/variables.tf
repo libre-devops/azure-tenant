@@ -9,6 +9,17 @@ variable "env" {
   }
 }
 
+variable "layer_name" {
+  type        = string
+  description = "Platform layer identifier for this run. Allowed values: foundation, networking, automation-standard, automation-privileged, alerting, sentinel, integration (case-insensitive)."
+  nullable    = false
+
+  validation {
+    condition     = contains(["foundation"], lower(trimspace(var.layer_name)))
+    error_message = "layer_name must be one of: foundation, automation, integration (case-insensitive)."
+  }
+}
+
 variable "short" {
   type        = string
   description = "Short resource prefix used in naming (lowercase letters/numbers/hyphens)."
@@ -28,16 +39,5 @@ variable "short_region" {
   validation {
     condition     = contains(["uks", "ukw", "euw"], lower(trimspace(var.short_region)))
     error_message = "short_region must be one of: uks, ukw, euw (case-insensitive)."
-  }
-}
-
-variable "layer_name" {
-  type        = string
-  description = "Platform layer identifier for this run. Allowed values: foundation, networking, automation-standard, automation-privileged, alerting, sentinel, integration (case-insensitive)."
-  nullable    = false
-
-  validation {
-    condition     = contains(["foundation"], lower(trimspace(var.layer_name)))
-    error_message = "layer_name must be one of: foundation, automation, integration (case-insensitive)."
   }
 }
