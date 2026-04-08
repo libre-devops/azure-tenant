@@ -1,6 +1,6 @@
-# MDE → Entra ID Group Sync
+# Entra ID Group Sync — JSON Config-Driven
 
-An Azure Automation runbook that automatically synchronises Microsoft Defender for Endpoint (MDE) Linux devices into an Entra ID security group, driven by MDE device tags.
+An Azure Automation runbook that synchronises explicitly configured Linux devices into Entra ID security groups, driven by per-group JSON definitions stored as Automation Variables.
 
 ---
 
@@ -10,30 +10,163 @@ When a Linux device is onboarded to MDE and Security Settings Management is enab
 
 The problem is that this synthetic object is not automatically added to any Entra ID group — which means it cannot be targeted by Conditional Access, RBAC, or other group-scoped policies without manual intervention.
 
-This runbook bridges that gap by running on a schedule, finding all tagged MDE devices, resolving their synthetic Entra IDs, and ensuring they are members of the correct security group.
+This runbook bridges that gap by running on a schedule, reading an explicit allowlist of device names per group, resolving each device to its Entra ID Object ID, and ensuring the correct group membership is maintained.
+
+### Why not MDE tags?
+
+The previous version of this runbook queried the MDE Machines API and used device tags to drive group membership. That approach was replaced for the following reasons:
+
+- MDE API lag means offboarded devices remain in query results for an indeterminate period
+- Tag-based inclusion is implicit — any misconfigured tag causes incorrect group membership
+- A single runbook could only target one group at a time
+
+The JSON allowlist model provides an explicit, auditable, Git-controlled definition of which devices belong in which group.
 
 ---
 
 ## How It Works
 
 ```
-Azure Automation (scheduled)
+Azure Automation (scheduled, every 60 minutes)
         │
         ├─ 1. Authenticate via User-Assigned Managed Identity
         │
-        ├─ 2. Query MDE API for devices matching tags + OS + health filters
+        ├─ 2. Load group configs from Automation Variables
+        │       └─ Each variable contains a JSON object (see schema below)
         │
-        ├─ 3. Resolve each device to its Entra ID Object ID
-        │       ├─ Fast path: aadDeviceId lookup
-        │       ├─ Exact displayName match (FQDN and short name)
-        │       └─ Fuzzy startswith match on short name
+        ├─ 3. Fetch ALL Entra device objects once into a local index
+        │       └─ Single paginated Graph API call — O(1) lookups thereafter
         │
-        ├─ 4. Compare resolved devices against current group members
-        │       ├─ Add any devices not yet in the group
-        │       └─ Optionally remove members no longer matching the filter
+        ├─ 4. For each configured group:
+        │       ├─ Resolve each device name against the local index
+        │       │     ├─ Exact displayName match (FQDN and short name)
+        │       │     ├─ Fuzzy startswith match on short name
+        │       │     └─ Pending (not yet in Entra — will retry next run)
+        │       │
+        │       ├─ Get current group members (paginated)
+        │       ├─ Add devices not yet in the group
+        │       └─ Optionally remove members not in the config (removeStale)
         │
-        └─ 5. Print summary report and exit
+        └─ 5. Print per-group summary report and exit
 ```
+
+---
+
+## Repository Layout
+
+```
+modules/foundation/
+  configs/
+    linux-group1.json          # one file per group
+    linux-group2.json
+    ...
+    linux-group6.json
+  scripts/
+    sync/
+      Sync-MDELinuxDeviceToEntraFromJson.ps1
+      Tests/
+        Sync-MDELinuxDeviceToEntraFromJson.Tests.ps1
+    debug/
+      Debug.ps1
+  tests/
+    json_group_config.tftest.hcl
+  main.tf
+  variables.tf
+  versions.tf
+```
+
+---
+
+## JSON Config Schema
+
+Each Automation Variable contains a single JSON object:
+
+```json
+{
+  "groupId":     "853451d5-e186-4362-9337-6f8ce967570a",
+  "name":        "linux-group1",
+  "removeStale": true,
+  "devices": [
+    "server01.contoso.local",
+    "server02"
+  ]
+}
+```
+
+| Field         | Required | Description                                                                                                 |
+|---------------|----------|-------------------------------------------------------------------------------------------------------------|
+| `groupId`     | Yes      | Entra ID security group Object ID                                                                           |
+| `name`        | No       | Human-readable label used in logging and the summary report                                                 |
+| `removeStale` | No       | If `true`, removes group members not in `devices`. Defaults to the runbook's `DefaultRemoveStale` parameter |
+| `devices`     | Yes      | Array of device names. Accepts FQDNs or short hostnames. Empty array = group skipped with WARN (no error)   |
+
+Device names are matched case-insensitively. Both `server01.contoso.local` and `server01` will resolve correctly.
+
+---
+
+## Terraform Infrastructure
+
+### Group Config Variables
+
+Each JSON config file is stored in `configs/` and loaded as an Automation Variable via Terraform. The variable name is derived automatically from the filename:
+
+```
+configs/linux-group1.json  →  Automation Variable: GroupConfig-linux-group1
+```
+
+To add a new group:
+
+1. Create `configs/linux-groupN.json` with the correct `groupId` and `devices`
+2. Add the key to the `raw_group_configs` map in `main.tf`
+3. Run `terraform apply`
+
+The runbook parameter `automationvariablenames` is built automatically from the map keys — no manual string editing required.
+
+### Terraform Check Blocks
+
+`main.tf` includes four check blocks that validate JSON config files at plan time:
+
+| Check                   | What it catches                                        |
+|-------------------------|--------------------------------------------------------|
+| `no_duplicate_devices`  | Same device listed twice within one group config       |
+| `valid_schema`          | Missing `groupId` or `devices` field, or invalid types |
+| `no_empty_device_lists` | `devices` array is present but empty                   |
+| `unique_group_ids`      | Same `groupId` referenced in two or more configs       |
+
+These fire as warnings during `terraform plan` and `terraform apply`. On HCP Terraform the plan can be approved despite a check warning — use the Terraform test suite (below) to enforce them in CI before the plan stage is reached.
+
+### Terraform Test Suite
+
+`terraform test` validates the JSON config files without any Azure credentials or real provider calls. All providers are mocked.
+
+```bash
+cd modules/foundation
+terraform test
+```
+
+Two test runs are defined in `tests/json_group_config.tftest.hcl`:
+
+| Run                                       | Purpose                                                                                      |
+|-------------------------------------------|----------------------------------------------------------------------------------------------|
+| `validate_config_integrity`               | Schema, duplicates, and unique groupIds — must always pass                                   |
+| `acknowledge_empty_groups_during_rollout` | Asserts that `check.no_empty_device_lists` fires (expected while groups are being populated) |
+
+When all groups have devices configured, remove the `acknowledge_empty_groups_during_rollout` run block and add an empty-device assertion to `validate_config_integrity`.
+
+### Resources Provisioned
+
+- `azurerm_resource_group`
+- `azurerm_user_assigned_identity`
+- `azurerm_automation_account` with `UserAssigned` identity
+- `azuread_app_role_assignment` × 2 (Graph: `Device.Read.All`, `GroupMember.ReadWrite.All`)
+- `azurerm_automation_variable_string` × N (one per group config, via `for_each`)
+- `azurerm_automation_runtime_environment` (PowerShell 7.2 + Az 11.2.0)
+- `azurerm_automation_runbook`
+- `azurerm_automation_schedule` + `azurerm_automation_job_schedule`
+- `azurerm_monitor_action_group`
+- `azurerm_monitor_metric_alert`
+
+> Note: `Machine.Read.All` on the WindowsDefenderATP service principal is no longer required. The MDE API dependency has been removed entirely.
 
 ---
 
@@ -42,177 +175,142 @@ Azure Automation (scheduled)
 ### Azure Automation Account
 
 - PowerShell 7.2 runtime environment
-- Az module version `11.2.0` installed in the runtime
-- A **User-Assigned Managed Identity** attached to the Automation Account
+- Az module version `11.2.0` in the runtime
+- A User-Assigned Managed Identity attached to the Automation Account
 
 ### Managed Identity API Permissions
 
-These are **application permissions** and must be granted via PowerShell or Terraform — the Azure Portal UI does not support assigning them to managed identities directly.
+Application permissions provisioned via Terraform (`azuread_app_role_assignment`):
 
-| API | Permission | Purpose |
-|-----|-----------|---------|
-| `api.securitycenter.microsoft.com` | `Machine.Read.All` | Read MDE device inventory and machine tags |
-| `graph.microsoft.com` | `Device.Read.All` | Look up Entra device objects by ID or display name |
-| `graph.microsoft.com` | `GroupMember.ReadWrite.All` | Read, add, and remove members from the target group |
+| API                   | Permission                  | Purpose                             |
+|-----------------------|-----------------------------|-------------------------------------|
+| `graph.microsoft.com` | `Device.Read.All`           | Fetch all Entra device objects      |
+| `graph.microsoft.com` | `GroupMember.ReadWrite.All` | Read, add, and remove group members |
 
-These are provisioned via Terraform using `azuread_app_role_assignment` resources in the infrastructure layer.
+### Entra ID — Synthetic Device Registration
 
-### MDE Security Settings Management
+For devices to be resolvable in Entra ID:
 
-For synthetic Entra ID device objects to be created, the following must be configured:
+1. **MDE** → Settings → Endpoints → Configuration Management → Enforcement Scope: Linux must be enabled
+2. **Intune** → Endpoint Security → Microsoft Defender for Endpoint: connector active, `Allow MDE to enforce security configurations` enabled
 
-1. In **MDE** → Settings → Endpoints → Configuration Management → Enforcement Scope: Linux devices must be enabled
-2. In **Intune** → Endpoint Security → Microsoft Defender for Endpoint: the connector must be active and `Allow MDE to enforce security configurations` must be enabled
-
-Once both sides are configured, devices will appear in Entra ID within 15–60 minutes of their next MDE agent heartbeat.
+Once configured, devices appear in Entra ID within 15–60 minutes of their next MDE agent heartbeat. Until then, they are tracked as **Pending** in the summary — this is expected and not treated as a failure.
 
 ---
 
-## Parameters
+## Runbook Parameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `ManagedIdentityClientId` | `string` | — | **Required.** Client ID of the User-Assigned Managed Identity |
-| `DeviceTag` | `string[]` | `@('RHEL-EDR', 'MDE-Management')` | One or more MDE machine tags. Devices matching any tag are included |
-| `EntraGroupObjectId` | `string` | — | **Required.** Object ID of the target Entra ID security group |
-| `RemoveStaleMembers` | `bool` | `$false` | If `$true`, removes group members that no longer match the tag filter |
-| `MaxRetries` | `int` | `6` | Maximum retry attempts for transient API failures |
-| `RetryDelaySeconds` | `int` | `20` | Fallback delay between retries when no `Retry-After` header is present |
-| `OsPlatforms` | `string[]` | RHEL, Ubuntu, CentOS, Debian, SLES | MDE `osPlatform` values to include in the server-side filter |
-| `HealthStatus` | `string[]` | `@('Active')` | MDE `healthStatus` values to include |
-| `WhatIf` | `bool` | `$false` | Dry-run mode — logs intended changes without making them |
+| Parameter                 | Type     | Default  | Description                                                                                                                                                 |
+|---------------------------|----------|----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `ManagedIdentityClientId` | `string` | —        | **Required.** Client ID of the User-Assigned Managed Identity. Passed via job schedule.                                                                     |
+| `AutomationVariableNames` | untyped  | —        | **Required.** Comma-separated Automation Variable names. Passed via job schedule. Arrives as `System.String` regardless of declaration.                     |
+| `DefaultRemoveStale`      | `bool`   | `$true`  | Fallback `removeStale` behaviour when not set per group. **Do not pass via job schedule** — `[bool]` binding from string is unreliable in Azure Automation. |
+| `WhatIf`                  | `bool`   | `$false` | Dry-run mode — logs all changes without writing to any group. **Do not pass via job schedule.**                                                             |
+| `MaxRetries`              | `int`    | `6`      | Maximum retry attempts for transient API failures                                                                                                           |
+| `RetryDelaySeconds`       | `int`    | `20`     | Fallback delay between retries when no `Retry-After` header is present                                                                                      |
+
+> `DefaultRemoveStale` and `WhatIf` are controlled by editing their default values in the script source, not by the job schedule. This avoids the `[bool]`-from-string binding issue in Azure Automation's job scheduler.
 
 ---
 
 ## Failure Model
 
-The runbook distinguishes between two categories of failure, because not all failures are equal in a cloud environment.
+| Situation                                    | Job Status | Alert   |
+|----------------------------------------------|------------|---------|
+| Device pending Entra registration            | Completed  | No      |
+| Group config has empty devices array         | Completed  | No      |
+| All groups have empty devices arrays         | Completed  | No      |
+| Device name ambiguous (fuzzy match conflict) | Completed  | No      |
+| Automation Variable missing or invalid JSON  | **Failed** | **Yes** |
+| Graph API call fails after all retries       | **Failed** | **Yes** |
+| Group add / remove operation fails           | **Failed** | **Yes** |
+| Unhandled exception                          | **Failed** | **Yes** |
 
-### Pending devices — job succeeds, no alert
-
-A device found in MDE but not yet resolvable in Entra ID is **not a failure**. It means the Intune/MDE synthetic registration is still propagating. The device is tracked in the summary under **Pending Entra Registration** and will be retried automatically on the next scheduled run. The job exits as `Completed`.
-
-### API errors — job fails, alert fires
-
-A genuine failure — retries exhausted on an API call, a permissions error, or a group add/remove operation that fails — increments the error counter. After the summary is printed, the job deliberately `throw`s, setting the job status to `Failed`. This causes the Azure Monitor metric alert to fire.
-
-| Situation | Job Status | Alert |
-|-----------|-----------|-------|
-| Device pending Entra registration | Completed | No |
-| 0 devices found (tag not yet applied) | Completed | No |
-| API call fails after all retries | **Failed** | **Yes** |
-| Group add / remove fails | **Failed** | **Yes** |
-| Unhandled exception | **Failed** | **Yes** |
-
----
-
-## Alerting Setup
-
-No Application Insights or Log Analytics workspace is required for failure alerting. Create a single Azure Monitor metric alert rule:
-
-| Setting | Value |
-|---------|-------|
-| Resource | Your Automation Account |
-| Signal | `TotalJob` (metric) |
-| Dimension: RunbookName | `Sync-MdeDevicesToEntraGroup` |
-| Dimension: Status | `Failed` |
-| Aggregation | Total |
-| Operator | Greater than or equal to |
-| Threshold | `1` |
-| Frequency | `PT5M` |
-| Action | Action Group (email / Teams webhook / SMS) |
-
-> Note: The metric name is `TotalJob` (singular) — not `TotalJobs`. The portal displays it as "Total Jobs" but the API name differs.
-
----
-
-## Logging
-
-The runbook uses four log levels, each mapped to a distinct PowerShell stream to ensure function return values are never corrupted.
-
-| Level | Stream | Visible in | Purpose |
-|-------|--------|-----------|---------|
-| `DEBUG` | `Write-Verbose` | Verbose output | Deep diagnostics, per-device resolution results |
-| `INFO` | `Write-Verbose` | Verbose output | High-level operational flow |
-| `WARN` | `Write-Warning` | Warning stream | Soft issues: pending devices, retries, fallback paths |
-| `ERROR` | `Write-Host` | Output stream | Hard failures only |
-
-> `Write-Output` is never used inside any function. At Az 11.2.0, `Write-Output` inside a function that also returns a value silently concatenates log lines onto the return value — this was the root cause of JWT corruption discovered during development.
-
-To see INFO and DEBUG detail, enable **Verbose logging** on the runbook in the Azure Automation portal, or set `$VerbosePreference = 'Continue'` when running locally.
+Pending devices are displayed in the summary under **Pending Entra Registration** and retried automatically on the next scheduled run. Ambiguous device names (where a fuzzy match returns multiple candidates) are shown under **Skipped — Ambiguous Resolution** and require the config to be corrected with a more specific name.
 
 ---
 
 ## Device Resolution
 
-Because MDE synthetic devices often have `aadDeviceId = null`, the runbook uses a three-stage fallback strategy to locate the correct Entra device object.
+The runbook fetches all Entra device objects in a single paginated call and builds a local hashtable index. Per-device resolution is then O(1) for exact matches.
 
 ```
-Stage 1 — aadDeviceId fast path
-   Query Graph by deviceId (exact, reliable when populated)
+Step 1 — Exact displayName match (case-insensitive)
+   Index lookup by full FQDN: 'server01.contoso.local'
 
-Stage 2 — Exact displayName match
-   Query by FQDN (craig-rhel9-vm1.mshome.net) OR short name (craig-rhel9-vm1)
-   Prefer result with blank trustType (characteristic of synthetic MDE devices)
+Step 2 — Short-name match
+   Index lookup by pre-dot segment: 'server01'
 
-Stage 3 — Fuzzy startswith match
-   Query startswith(displayName, 'shortname')
-   Prefer blank trustType, fall back to first result
+Step 3 — Fuzzy startswith match
+   List scan: any device whose short name starts with the input short name
+   Skipped if more than one candidate (ambiguous — logged as WARN, not error)
 
-Stage 4 — Soft failure
-   Device logged as pending, tracked in summary, retried next run
+Step 4 — Pending
+   Device not found by any strategy. Tracked in summary, retried next run.
 ```
 
 ---
 
-## Terraform Infrastructure
+## Logging
 
-The supporting infrastructure is provisioned via Terraform and includes:
+| Level   | PowerShell Stream          | Visible in Portal                        |
+|---------|----------------------------|------------------------------------------|
+| `DEBUG` | `Write-Verbose` (stream 4) | All Logs tab (when `log_verbose = true`) |
+| `INFO`  | `Write-Host` (stream 6)    | Output tab and All Logs tab              |
+| `WARN`  | `Write-Warning` (stream 3) | Warnings tab and All Logs tab            |
+| `ERROR` | `Write-Host` (stream 6)    | Output tab and All Logs tab              |
 
-- `azurerm_resource_group`
-- `azurerm_user_assigned_identity` (the Managed Identity)
-- `azurerm_automation_account` with `UserAssigned` identity
-- `azuread_app_role_assignment` × 3 (Graph × 2, Defender × 1)
-- `azurerm_automation_runtime_environment` (PowerShell 7.2 + Az 11.2.0)
-- `azurerm_automation_runbook`
-- `azurerm_automation_schedule` + `azurerm_automation_job_schedule`
-- `azurerm_monitor_action_group`
-- `azurerm_monitor_metric_alert`
+`Write-Output` is never used inside any function — it writes to stream 1 (the pipeline) and would corrupt return values such as tokens and device IDs.
 
 ---
 
-## Running Locally
+## Alerting Setup
 
-To run the script outside of Automation for testing:
+| Setting                | Value                                                  |
+|------------------------|--------------------------------------------------------|
+| Resource               | Your Automation Account                                |
+| Signal                 | `TotalJob` (metric)                                    |
+| Dimension: RunbookName | Value of `foundation_mde_sync_automation_runbook_name` |
+| Dimension: Status      | `Failed`                                               |
+| Aggregation            | Total                                                  |
+| Operator               | Greater than or equal to                               |
+| Threshold              | `1`                                                    |
+| Frequency              | `PT5M`                                                 |
+| Window                 | `PT5M`                                                 |
+
+> The metric name is `TotalJob` (singular) — the portal displays it as "Total Jobs" but the API name differs.
+
+---
+
+## Pester Tests
+
+Unit tests cover the pure in-memory logic of the runbook with no Azure credentials or API calls.
 
 ```powershell
-# Requires Az module installed and an active az login session
-$VerbosePreference = 'Continue'   # show INFO/DEBUG logs
-
-.\Sync-MdeDevicesToEntraGroup.ps1 `
-    -ManagedIdentityClientId '<your-mi-client-id>' `
-    -DeviceTag                @('RHEL-EDR') `
-    -EntraGroupObjectId       '<your-group-object-id>' `
-    -WhatIf                   $true   # dry run — no writes
+cd modules/foundation/scripts/sync
+Invoke-Pester ./Tests/Sync-MDELinuxDeviceToEntraFromJson.Tests.ps1 -Output Detailed
 ```
+
+| Describe block               | What is tested                                                    |
+|------------------------------|-------------------------------------------------------------------|
+| `Log-Message stream routing` | Each level writes to the correct stream; ERROR does not throw     |
+| `NormalizeVariableNames`     | Splitting, trimming, deduplication, sort order, throw on empty    |
+| `Sanitize-InputString`       | Quote stripping, whitespace trimming, passthrough of clean values |
+| `Resolve-Device`             | Exact, short-name, fuzzy, ambiguous, and pending resolution paths |
+| `Build-DeviceIndex`          | Index structure, first-write-wins dedup, null displayName skip    |
 
 ---
 
 ## Known Behaviours
 
-**Eventual consistency** — MDE and Entra ID are not strongly consistent. A device newly onboarded to MDE may take 15–60 minutes to appear in Entra ID after Security Settings Management enrollment completes. The runbook handles this gracefully.
+**Eventual consistency** — MDE and Entra ID are not strongly consistent. A newly onboarded device may take 15–60 minutes to appear in Entra ID after enrollment completes. The runbook handles this gracefully by tracking pending devices separately from errors.
 
-**DNS variants** — The `computerDnsName` field in MDE may contain a fully qualified domain name (`host.domain.local`) or just a hostname. The resolution logic handles both by attempting FQDN and short name matches independently.
+**DNS variants** — `computerDnsName` in MDE may be a FQDN or just a hostname. Both are handled by the resolution index which stores both the full name and the pre-dot segment.
 
-**Duplicate devices** — If a device carries multiple matching tags it will only appear once in the resolved set. Deduplication is handled via a `HashSet` keyed on the MDE device ID.
+**Empty groups during rollout** — Groups with an empty `devices` array in their JSON config are skipped with a WARN and do not increment the error count. This allows the runbook to run cleanly while groups are being populated incrementally.
 
-**Race conditions** — If two runbook instances overlap and both attempt to add the same device simultaneously, the Graph API returns a `400 already exists` error. This is caught and silently ignored.
+**Parameter binding** — Azure Automation passes all job schedule parameters as strings. `AutomationVariableNames` is declared untyped and split inside the runbook. `[bool]` parameters (`DefaultRemoveStale`, `WhatIf`) are not passed via job schedule to avoid coercion issues.
+
+**Race conditions** — If two runbook instances overlap and both attempt to add the same device, Graph returns `400 already exists`. This is caught and silently ignored.
 
 ---
-
-## Potential Future Improvements
-
-- Cache resolved Entra Object IDs across runs to reduce Graph API calls
-- Parallel device resolution for large device inventories
-- Persist the pending device list to storage and emit a warning if a device remains pending for more than N runs
-- Export run metrics to Log Analytics for dashboarding and trend analysis
