@@ -1,82 +1,73 @@
 #Requires -Version 7.2
 <#
 .SYNOPSIS
-    Azure Automation Runbook — Syncs MDE-tagged Linux devices into an Entra ID security group.
+    Azure Automation Runbook — Syncs explicitly-configured devices into Entra ID security
+    groups using per-group JSON definitions stored in Azure Automation Variables.
 
 .DESCRIPTION
-    Authenticates via a User-Assigned Managed Identity using the Az module
-    (Connect-AzAccount + Get-AzAccessToken). Queries the MDE Machines API for devices
-    carrying specified tags, and ensures each device's Entra ID object is a member of
-    the target security group. Removes stale members if configured to do so.
+    Replaces the MDE-tag-based discovery model with an explicit JSON allowlist model.
+    Each Automation Variable contains a JSON object defining one group and its member
+    devices. The script loads all configs, fetches ALL Entra device objects once into a
+    local index, then diffs and syncs each group independently.
 
-    At the end of every run a summary is printed showing all current members, what was
-    added, what was removed, pending devices (eventual consistency), and the error count.
+    RESOLUTION ORDER (per device name)
+    ────────────────────────────────────
+    1. Exact displayName match (case-insensitive)         → fast hashtable O(1)
+    2. Short-name (pre-dot) match                         → fast hashtable O(1)
+    3. Fuzzy startswith match                             → list scan, skipped if ambiguous
+
+    Ambiguous matches (>1 candidate in step 3) are skipped and logged as WARN. They
+    appear in the summary under SKIPPED and do NOT increment the error count.
 
     ERROR PHILOSOPHY
     ────────────────
-    $script:SyncErrorCount is incremented ONLY for genuine failures:
-        - API call failures (retries exhausted)
-        - Group add / remove failures
+    $script:SyncErrorCount — genuine API / group operation failures only.
+    $script:PendingCount   — devices not found in Entra (expected during propagation).
 
-    Resolution failures (device found in MDE but not yet in Entra) are tracked
-    separately as $script:PendingCount and logged as WARN. These are expected during
-    the Intune/MDE synthetic registration propagation window and do NOT cause the job
-    to fail — the next scheduled run will retry automatically.
+    Pending and skipped counts never cause the job to fail. Only API errors throw at end.
 
-    LOGGING
-    ───────
-    Write-Verbose : All operational detail (auth steps, token acquisition, per-device
-                    resolution results, skip/add/remove per device). Safe inside
-                    functions that return values — never pollutes the output stream.
-    Write-Host    : Summary report sections and ERROR lines only.
-    Write-Warning : WARN-level log messages.
-    Write-Output  : NEVER used — would corrupt function return values (tokens, IDs).
-
-    RETRY
-    ─────
-    Up to MaxRetries attempts with 429-aware Retry-After header support.
-
-    AUTH
-    ────
-    User-Assigned Managed Identity via Az module (Connect-AzAccount + Get-AzAccessToken).
+    LOGGING / RETRY / AUTH
+    ──────────────────────
+    Identical to the original runbook. Write-Verbose for INFO/DEBUG, Write-Warning for
+    WARN, Write-Host for summary sections and ERROR lines only. Write-Output is never
+    used — it would corrupt function return values.
 
 .PARAMETER ManagedIdentityClientId
     Client ID of the User-Assigned Managed Identity attached to this Automation Account.
 
-.PARAMETER DeviceTag
-    One or more MDE machine tags to filter on. Devices matching ANY tag are included.
-    Example: @('RHEL-EDR', 'UBUNTU-EDR')
+.PARAMETER AutomationVariableNames
+    Array of Automation Variable names to load. Each must contain a valid JSON group
+    config (see schema below). Variables are processed in order; invalid configs are
+    skipped with an error logged.
 
-.PARAMETER EntraGroupObjectId
-    Object ID of the target Entra ID security group.
-
-.PARAMETER RemoveStaleMembers
-    If $true, devices currently in the group that no longer match any tag are removed.
-    Defaults to $false (additive-only).
-
-.PARAMETER ForceRemoveDeviceIds
-    One or more Entra ID Object IDs to explicitly remove from the group, regardless of
-    tag state. Use this when MDE API lag prevents automatic stale removal of offboarded
-    devices. If a supplied ID is not in the group, a 'nothing to do' message is logged
-    and no error is raised.
+.PARAMETER DefaultRemoveStale
+    Global fallback for removeStale behaviour when not specified per group.
+    Default: $true — devices absent from the config are removed from the group.
 
 .PARAMETER MaxRetries
-    Maximum number of retry attempts for transient API failures. Default: 6.
+    Maximum retry attempts for transient API failures. Default: 6.
 
 .PARAMETER RetryDelaySeconds
-    Fallback delay (seconds) between retries when no Retry-After header is present.
-    Default: 20.
-
-.PARAMETER OsPlatforms
-    OS platform values to include when querying MDE. Defaults to common Linux distros.
-
-.PARAMETER HealthStatus
-    MDE health status values to include. Defaults to Active only.
+    Fallback retry delay (seconds) when no Retry-After header is present. Default: 20.
 
 .PARAMETER WhatIf
-    If $true, no writes are made to the group. Add/remove operations are logged only.
+    If $true, no writes are made to any group. All add/remove operations are logged only.
 
 .NOTES
+    ─────────────────────────────────────────────────────────────────────────────
+    JSON CONFIG SCHEMA  (one object per Automation Variable)
+    ─────────────────────────────────────────────────────────────────────────────
+
+    {
+      "groupId":     "853451d5-e186-4362-9337-6f8ce967570a",  // required
+      "name":        "Linux Prod EDR",                         // optional  (used for logging)
+      "removeStale": true,                                     // optional  (overrides DefaultRemoveStale)
+      "devices": [                                             // required  (1+ entries)
+        "server01.contoso.local",
+        "server02"
+      ]
+    }
+
     ─────────────────────────────────────────────────────────────────────────────
     REQUIRED MANAGED IDENTITY — API PERMISSIONS
     ─────────────────────────────────────────────────────────────────────────────
@@ -84,16 +75,15 @@
     APPLICATION permissions on the User-Assigned Managed Identity.
     Provisioned via Terraform (azuread_app_role_assignment).
 
-    ┌──────────────────────────────────────────────────┬──────────────────────────────────┬──────────────────────────────────────────────────────┐
-    │ API                                              │ Permission                       │ Purpose                                              │
-    ├──────────────────────────────────────────────────┼──────────────────────────────────┼──────────────────────────────────────────────────────┤
-    │ WindowsDefenderATP                               │ Machine.Read.All                 │ Query MDE Machines API; read machineTags             │
-    │ (api.securitycenter.microsoft.com)               │                                  │                                                      │
-    ├──────────────────────────────────────────────────┼──────────────────────────────────┼──────────────────────────────────────────────────────┤
-    │ Microsoft Graph                                  │ Device.Read.All                  │ Look up Entra device objects by aadDeviceId /        │
-    │ (graph.microsoft.com)                            │                                  │ displayName                                          │
-    │                                                  │ GroupMember.ReadWrite.All        │ Read, add and remove group members                   │
-    └──────────────────────────────────────────────────┴──────────────────────────────────┴──────────────────────────────────────────────────────┘
+    ┌─────────────────────────┬──────────────────────────────┬──────────────────────────────────┐
+    │ API                     │ Permission                   │ Purpose                          │
+    ├─────────────────────────┼──────────────────────────────┼──────────────────────────────────┤
+    │ Microsoft Graph         │ Device.Read.All              │ Fetch all Entra device objects   │
+    │ (graph.microsoft.com)   │ GroupMember.ReadWrite.All    │ Read, add and remove members     │
+    └─────────────────────────┴──────────────────────────────┴──────────────────────────────────┘
+
+    NOTE: WindowsDefenderATP / Machine.Read.All is no longer required.
+          The MDE dependency has been removed entirely.
 #>
 
 [CmdletBinding()]
@@ -101,41 +91,27 @@ param (
     [Parameter(Mandatory)]
     [string] $ManagedIdentityClientId,
 
-    [string[]] $DeviceTag = @('RHEL-EDR', 'MDE-Management'),
+    [Parameter(Mandatory)]
+    [string[]] $AutomationVariableNames,
 
-    [string] $EntraGroupObjectId = '853451d5-e186-4362-9337-6f8ce967570a',
-
-    [bool] $RemoveStaleMembers = $false,
-
-    [string[]] $ForceRemoveDeviceIds = @(),
+    [bool] $DefaultRemoveStale = $true,
 
     [int]  $MaxRetries = 6,
     [int]  $RetryDelaySeconds = 20,
-    [bool] $WhatIf = $false,
-
-    [string[]] $OsPlatforms = @(
-    'RedHatEnterpriseLinux',
-    'Ubuntu',
-    'CentOS',
-    'Debian',
-    'SLES'
-),
-
-    [string[]] $HealthStatus = @('Active')
+    [bool] $WhatIf = $false
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Genuine API / group operation failures — triggers Azure Monitor alert via throw at end
+# Genuine API / group operation failures — triggers Azure Monitor alert via throw at end.
 $script:SyncErrorCount = 0
 
-# Devices found in MDE but not yet resolvable in Entra ID (Intune propagation window)
-# Does NOT trigger an alert — next scheduled run will retry automatically
+# Devices not found in Entra ID (propagation window). Does NOT trigger an alert.
 $script:PendingCount = 0
 
 # ============================================================
-#  LOGGER
+#  LOGGER  (unchanged from original)
 # ============================================================
 
 function Log-Message
@@ -147,79 +123,79 @@ function Log-Message
         [string] $InvocationName
     )
 
-    $ts = Get-Date -Format 'HH:mm:ss'
+    $ts     = Get-Date -Format 'HH:mm:ss'
     $prefix = "$ts [$InvocationName]"
 
     switch ($Level)
     {
-        # Write-Verbose: operational detail, safe inside functions that return values.
-        # Write-Output must NEVER be used — it corrupts return values (tokens, IDs).
-        'DEBUG' {
-            Write-Verbose "$prefix $Message"
-        }
-        'INFO'  {
-            Write-Verbose "$prefix $Message"
-        }
-        # Write-Warning and Write-Host go to separate streams, safe anywhere.
-        'WARN'  {
-            Write-Warning "$prefix $Message"
-        }
-        'ERROR' {
-            Write-Host   "$prefix $Message" -ForegroundColor Red
-        }
+        'DEBUG' { Write-Verbose "$prefix $Message" }
+        'INFO'  { Write-Verbose "$prefix $Message" }
+        'WARN'  { Write-Warning "$prefix $Message" }
+        'ERROR' { Write-Host   "$prefix $Message" -ForegroundColor Red }
     }
 }
 
+
+try
+{
+    Log-Message -Level DEBUG `
+                -Message "Attempting to strip AutomationVariableNames. They currently are: $($AutomationVariableNames -join ', ')" `
+                -InvocationName $MyInvocation.MyCommand.Name
+
+    $AutomationVariableNames = $AutomationVariableNames | ForEach-Object {
+        if ($_ -and $_ -is [string])
+        {
+            $_.Trim()
+        }
+        else
+        {
+            $_
+        }
+    }
+
+    Log-Message -Level DEBUG `
+                -Message "Stripped AutomationVariableNames, they now are: $($AutomationVariableNames -join ', ')" `
+                -InvocationName $MyInvocation.MyCommand.Name
+}
+catch
+{
+    Log-Message -Level ERROR `
+                -Message "Failed to normalise AutomationVariableNames: $($_.Exception.Message)" `
+                -InvocationName $MyInvocation.MyCommand.Name
+
+    throw
+}
+
 # ============================================================
-#  AUTH (USER-ASSIGNED MANAGED IDENTITY)
+#  AUTH  (unchanged from original)
 # ============================================================
 
 function Initialize-ManagedIdentityAuth
 {
-    <#
-    .SYNOPSIS
-        Establishes an Az module context for the specified User-Assigned Managed Identity.
-        Must be called before Get-AccessToken.
-    #>
     try
     {
         Log-Message -Level INFO `
                     -Message "Authenticating via User-Assigned Managed Identity (ClientId: $ManagedIdentityClientId)..." `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -InvocationName $MyInvocation.MyCommand.Name
 
         Disable-AzContextAutosave -Scope Process -ErrorAction SilentlyContinue | Out-Null
-
-        Connect-AzAccount `
-            -Identity `
-            -AccountId  $ManagedIdentityClientId `
-            -ErrorAction Stop | Out-Null
+        Connect-AzAccount -Identity -AccountId $ManagedIdentityClientId -ErrorAction Stop | Out-Null
 
         Log-Message -Level INFO `
                     -Message "Managed Identity authentication successful." `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -InvocationName $MyInvocation.MyCommand.Name
     }
     catch
     {
         Log-Message -Level ERROR `
-                    -Message "Authentication FAILED: $( $_.Exception.Message )" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -Message "Authentication FAILED: $($_.Exception.Message)" `
+                    -InvocationName $MyInvocation.MyCommand.Name
         throw
     }
 }
 
 function Get-AccessToken
 {
-    <#
-    .SYNOPSIS
-        Returns a plain-string bearer token for the given resource.
-
-    .NOTES
-        Write-Verbose is used throughout — Write-Output would concatenate log lines
-        onto the token string, producing a corrupt JWT with extra content prepended.
-
-        At Az 11.2.0, Get-AzAccessToken returns Token as a plain System.String.
-        The explicit [string] cast guards against edge cases where PS wraps it in Object[].
-    #>
     param (
         [Parameter(Mandatory)]
         [string] $Resource
@@ -229,11 +205,9 @@ function Get-AccessToken
     {
         Log-Message -Level INFO `
                     -Message "Requesting token for: $Resource" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -InvocationName $MyInvocation.MyCommand.Name
 
-        $tokenResponse = Get-AzAccessToken `
-            -ResourceUrl $Resource `
-            -ErrorAction Stop
+        $tokenResponse = Get-AzAccessToken -ResourceUrl $Resource -ErrorAction Stop
 
         if (-not $tokenResponse.Token)
         {
@@ -243,22 +217,22 @@ function Get-AccessToken
         $token = [string]$tokenResponse.Token
 
         Log-Message -Level DEBUG `
-                    -Message "Token acquired (type: $( $tokenResponse.Token.GetType().Name ), length: $( $token.Length ))" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -Message "Token acquired (type: $($tokenResponse.Token.GetType().Name), length: $($token.Length))" `
+                    -InvocationName $MyInvocation.MyCommand.Name
 
         return $token
     }
     catch
     {
         Log-Message -Level ERROR `
-                    -Message "Failed to acquire token for '$Resource': $( $_.Exception.Message )" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -Message "Failed to acquire token for '$Resource': $($_.Exception.Message)" `
+                    -InvocationName $MyInvocation.MyCommand.Name
         throw
     }
 }
 
 # ============================================================
-#  RETRY (429-aware)
+#  RETRY
 # ============================================================
 
 function Invoke-WithRetry
@@ -268,27 +242,23 @@ function Invoke-WithRetry
         [string]      $OperationName = 'Operation'
     )
 
-    for ($i = 1; $i -le $MaxRetries; $i++) {
+    for ($i = 1; $i -le $MaxRetries; $i++)
+    {
         try
         {
             return & $ScriptBlock
         }
         catch
         {
-            $msg = $_.Exception.Message
-
-            # Safely extract Retry-After — plain exceptions (e.g. System.Exception thrown in tests
-            # or non-HTTP errors) do not have a Response property. Under Set-StrictMode -Version Latest
-            # accessing a missing property throws, so we guard with PSObject.Properties first.
+            $msg        = $_.Exception.Message
             $retryAfter = $null
+
             if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response)
             {
                 $retryAfter = $_.Exception.Response.Headers?['Retry-After']
             }
-            if ($retryAfter -is [array])
-            {
-                $retryAfter = $retryAfter[0]
-            }
+            if ($retryAfter -is [array]) { $retryAfter = $retryAfter[0] }
+
             $delay = if ($retryAfter -and ($retryAfter -as [int]))
             {
                 [int]$retryAfter
@@ -302,98 +272,47 @@ function Invoke-WithRetry
             {
                 Log-Message -Level ERROR `
                             -Message "FAILED after $MaxRetries attempts: $OperationName | $msg" `
-                            -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                            -InvocationName $MyInvocation.MyCommand.Name
                 throw
             }
 
             Log-Message -Level WARN `
                         -Message "Retry $i/$MaxRetries for '$OperationName' | waiting ${delay}s | $msg" `
-                        -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                        -InvocationName $MyInvocation.MyCommand.Name
             Start-Sleep -Seconds $delay
         }
     }
 }
 
 # ============================================================
-#  MDE
+#  DEVICE INDEX
 # ============================================================
 
-function Get-MdeDevicesByTag
+function Build-DeviceIndex
 {
-    param (
-        [string[]] $Tags,
-        [string]   $Token,
-        [string[]] $OsPlatforms,
-        [string[]] $HealthStatus
-    )
+    <#
+    .SYNOPSIS
+        Fetches ALL Entra ID device objects in a single paginated call and builds two
+        lookup structures used by Resolve-Device:
 
-    Log-Message -Level INFO `
-                -Message "Querying MDE | Tags: '$( $Tags -join "', '" )' | OS: '$( $OsPlatforms -join "', '" )' | Health: '$( $HealthStatus -join "', '" )'" `
-                -InvocationName "$( $MyInvocation.MyCommand.Name )"
+        $DeviceIndex  — hashtable : lowercased displayName (exact + short) → Object ID
+        $FuzzyList    — array     : PSCustomObjects for startswith fallback
 
-    $tagSet = [System.Collections.Generic.HashSet[string]]($Tags)
-    $osSet = [System.Collections.Generic.HashSet[string]]($OsPlatforms)
-    $healthSet = [System.Collections.Generic.HashSet[string]]($HealthStatus)
-    $seen = [System.Collections.Generic.HashSet[string]]::new()
-    $all = [System.Collections.Generic.List[pscustomobject]]::new()
+        Replaces O(n) per-device Graph calls with a single bulk fetch.
+        Handles pagination transparently via @odata.nextLink.
+    #>
+    param ([string] $GraphToken)
 
-    # Server-side filter on OS, health, and exclusion status to reduce payload size.
-    # isExcluded eq false ensures offboarded/inactive devices are excluded from results —
-    # MDE does not promptly remove offboarded devices from the API but does stamp them
-    # with isExcluded: true, which is the reliable signal for "no longer managed".
-    $osFilter = ($OsPlatforms  | ForEach-Object { "osPlatform eq '$_'" }) -join ' or '
-    $healthFilter = ($HealthStatus | ForEach-Object { "healthStatus eq '$_'" }) -join ' or '
-    $uri = "https://api.securitycenter.microsoft.com/api/machines?`$filter=($osFilter) and ($healthFilter) and isExcluded eq false"
+    $allDevices = [System.Collections.Generic.List[pscustomobject]]::new()
+    $uri        = "https://graph.microsoft.com/v1.0/devices?`$select=id,displayName&`$top=999"
 
     do
     {
-        $res = Invoke-WithRetry -OperationName 'MDE OS+Health query' -ScriptBlock {
-            Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $Token" }
+        $res = Invoke-WithRetry -OperationName 'Fetch all Entra devices' -ScriptBlock {
+            Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $GraphToken" }
         }
 
-        if ($res.value)
-        {
-            foreach ($device in $res.value)
-            {
-                # Client-side defensive checks
-                if (-not $device.osPlatform -or -not $osSet.Contains($device.osPlatform))
-                {
-                    continue
-                }
-                if (-not $device.healthStatus -or -not $healthSet.Contains($device.healthStatus))
-                {
-                    continue
-                }
-                if (-not $device.machineTags)
-                {
-                    continue
-                }
-
-                # Tag match — device must carry at least one of the requested tags
-                $matched = $false
-                foreach ($tag in $device.machineTags)
-                {
-                    if ( $tagSet.Contains($tag))
-                    {
-                        $matched = $true; break
-                    }
-                }
-
-                if ($matched)
-                {
-                    if ( $seen.Add($device.id))
-                    {
-                        $all.Add($device)
-                    }
-                    else
-                    {
-                        Log-Message -Level DEBUG `
-                                    -Message "Skipping duplicate '$( $device.computerDnsName )' (seen via another tag)." `
-                                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
-                    }
-                }
-            }
-        }
+        if ($res.value) { $allDevices.AddRange([pscustomobject[]]$res.value) }
 
         $uri = if ($res.PSObject.Properties.Name -contains '@odata.nextLink')
         {
@@ -403,145 +322,106 @@ function Get-MdeDevicesByTag
         {
             $null
         }
-
-    } while ($uri)
+    }
+    while ($uri)
 
     Log-Message -Level INFO `
-                -Message "Matched $( $all.Count ) device(s) after tag + OS + health + exclusion filtering." `
-                -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                -Message "Fetched $($allDevices.Count) Entra device object(s) into local index." `
+                -InvocationName 'Build-DeviceIndex'
 
-    return $all.ToArray()
+    $deviceIndex = @{}
+    $fuzzyList   = [System.Collections.Generic.List[pscustomobject]]::new()
+
+    foreach ($d in $allDevices)
+    {
+        if (-not $d.displayName) { continue }
+
+        $full  = $d.displayName.ToLower()
+        $short = $full.Split('.')[0]
+
+        # First-write-wins for duplicate names — consistent with original fallback behaviour.
+        if (-not $deviceIndex.ContainsKey($full))  { $deviceIndex[$full]  = $d.id }
+        if (-not $deviceIndex.ContainsKey($short)) { $deviceIndex[$short] = $d.id }
+
+        $fuzzyList.Add([pscustomobject]@{
+            Name  = $full
+            Short = $short
+            Id    = $d.id
+        })
+    }
+
+    # Return both structures; caller unpacks with: $deviceIndex, $fuzzyList = Build-DeviceIndex ...
+    return $deviceIndex, $fuzzyList.ToArray()
 }
 
-# ============================================================
-#  RESOLUTION
-# ============================================================
-
-function Resolve-EntraDeviceId
+function Resolve-Device
 {
     <#
     .SYNOPSIS
-        Attempts to resolve a device's Entra ID Object ID via three strategies:
-        1. aadDeviceId fast path
-        2. Exact displayName match (FQDN and short name)
-        3. Fuzzy startswith match on short name
+        Resolves a device name to an Entra Object ID using the pre-built index.
 
-        Returns $null if the device is not yet in Entra ID (propagation pending).
-        Callers should treat $null as WARN/pending, not as an error.
+        Returns a typed PSCustomObject so callers can distinguish between:
+            Resolved  — Id populated, device found
+            Pending   — Id is $null, device not found anywhere (propagation window)
+            Ambiguous — Id is $null, fuzzy match returned multiple candidates (skipped)
+
+        This avoids conflating two distinct non-error states into a bare $null return.
     #>
-    param ($Device, $GraphToken)
+    param (
+        [string]    $DeviceName,
+        [hashtable] $DeviceIndex,
+        [array]     $FuzzyList
+    )
 
-    $name = $Device.computerDnsName
-    $shortName = $name.Split('.')[0]
+    $normalized = $DeviceName.ToLower()
+    $short      = $normalized.Split('.')[0]
 
-    # 1. Fast path — aadDeviceId populated
-    if ($Device.aadDeviceId)
+    # 1. Exact displayName match (covers both FQDN and short name in one lookup)
+    if ($DeviceIndex.ContainsKey($normalized))
     {
-        try
-        {
-            $res = Invoke-WithRetry -OperationName "Resolve aadDeviceId ($name)" -ScriptBlock {
-                Invoke-RestMethod `
-                    -Uri     "https://graph.microsoft.com/v1.0/devices?`$filter=deviceId eq '$( $Device.aadDeviceId )'&`$select=id,displayName" `
-                    -Headers @{ Authorization = "Bearer $GraphToken" }
-            }
-
-            if ($res.value)
-            {
-                Log-Message -Level DEBUG `
-                            -Message "Resolved '$name' via aadDeviceId → $( $res.value[0].id )" `
-                            -InvocationName "$( $MyInvocation.MyCommand.Name )"
-                return $res.value[0].id
-            }
-        }
-        catch
-        {
-            Log-Message -Level WARN `
-                        -Message "aadDeviceId lookup failed for '$name': $( $_.Exception.Message )" `
-                        -InvocationName "$( $MyInvocation.MyCommand.Name )"
-        }
+        Log-Message -Level DEBUG `
+                    -Message "Resolved '$DeviceName' via exact match → $($DeviceIndex[$normalized])" `
+                    -InvocationName 'Resolve-Device'
+        return [pscustomobject]@{ Status = 'Resolved'; Id = $DeviceIndex[$normalized] }
     }
 
-    # 2. Exact displayName match (FQDN and short name)
-    Log-Message -Level INFO `
-                -Message "Attempting Graph exact match for '$name'." `
-                -InvocationName "$( $MyInvocation.MyCommand.Name )"
-
-    try
+    if ($DeviceIndex.ContainsKey($short))
     {
-        $filter = "displayName eq '$name' or displayName eq '$shortName'"
-        $res = Invoke-WithRetry -OperationName "Graph exact match ($name)" -ScriptBlock {
-            Invoke-RestMethod `
-                -Uri     "https://graph.microsoft.com/v1.0/devices?`$filter=$filter&`$select=id,displayName,trustType" `
-                -Headers @{ Authorization = "Bearer $GraphToken" }
-        }
-
-        if ($res.value)
-        {
-            # Prefer blank trustType (synthetic MDE/Intune device); fall back to first result
-            $match = $res.value | Where-Object { -not $_.trustType } | Select-Object -First 1
-            if (-not $match)
-            {
-                $match = $res.value | Select-Object -First 1
-            }
-
-            Log-Message -Level DEBUG `
-                        -Message "Resolved '$name' via exact match → '$( $match.displayName )' ($( $match.id ))" `
-                        -InvocationName "$( $MyInvocation.MyCommand.Name )"
-            return $match.id
-        }
+        Log-Message -Level DEBUG `
+                    -Message "Resolved '$DeviceName' via short-name match → $($DeviceIndex[$short])" `
+                    -InvocationName 'Resolve-Device'
+        return [pscustomobject]@{ Status = 'Resolved'; Id = $DeviceIndex[$short] }
     }
-    catch
+
+    # 2. Fuzzy startswith match — fallback only, skipped when ambiguous
+    $candidates = @($FuzzyList | Where-Object { $_.Short.StartsWith($short) })
+
+    if ($candidates.Count -eq 1)
     {
+        Log-Message -Level DEBUG `
+                    -Message "Resolved '$DeviceName' via fuzzy match → '$($candidates[0].Name)' ($($candidates[0].Id))" `
+                    -InvocationName 'Resolve-Device'
+        return [pscustomobject]@{ Status = 'Resolved'; Id = $candidates[0].Id }
+    }
+
+    if ($candidates.Count -gt 1)
+    {
+        $names = $candidates | Select-Object -ExpandProperty Name
         Log-Message -Level WARN `
-                    -Message "Exact match lookup failed for '$name': $( $_.Exception.Message )" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -Message "Ambiguous fuzzy match for '$DeviceName' — $($candidates.Count) candidates: $($names -join ', '). Skipping to avoid incorrect assignment." `
+                    -InvocationName 'Resolve-Device'
+        return [pscustomobject]@{ Status = 'Ambiguous'; Id = $null }
     }
 
-    # 3. Fuzzy startswith match on short name
-    Log-Message -Level INFO `
-                -Message "Attempting fuzzy (startswith) match for '$name' using short name '$shortName'." `
-                -InvocationName "$( $MyInvocation.MyCommand.Name )"
-
-    try
-    {
-        $res = Invoke-WithRetry -OperationName "Graph fuzzy match ($name)" -ScriptBlock {
-            Invoke-RestMethod `
-                -Uri     "https://graph.microsoft.com/v1.0/devices?`$filter=startswith(displayName,'$shortName')&`$select=id,displayName,trustType" `
-                -Headers @{ Authorization = "Bearer $GraphToken" }
-        }
-
-        if ($res.value)
-        {
-            $match = $res.value | Where-Object { -not $_.trustType } | Select-Object -First 1
-            if (-not $match)
-            {
-                $match = $res.value | Select-Object -First 1
-            }
-
-            Log-Message -Level DEBUG `
-                        -Message "Resolved '$name' via fuzzy match → '$( $match.displayName )' ($( $match.id ))" `
-                        -InvocationName "$( $MyInvocation.MyCommand.Name )"
-            return $match.id
-        }
-    }
-    catch
-    {
-        Log-Message -Level WARN `
-                    -Message "Fuzzy match failed for '$name': $( $_.Exception.Message )" `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
-    }
-
-    # All strategies exhausted — device not yet in Entra
-    # This is expected during Intune/MDE propagation. Caller tracks as pending, not error.
+    # Not found by any strategy
     Log-Message -Level WARN `
-                -Message "Could not resolve '$name' in Entra ID — likely pending synthetic registration. Will retry next run." `
-                -InvocationName "$( $MyInvocation.MyCommand.Name )"
-
-    return $null
+                -Message "Could not resolve '$DeviceName' in Entra ID — likely pending synthetic registration. Will retry next run." `
+                -InvocationName 'Resolve-Device'
+    return [pscustomobject]@{ Status = 'Pending'; Id = $null }
 }
 
 # ============================================================
-#  GROUP OPS
+#  GROUP OPS  (unchanged signatures from original)
 # ============================================================
 
 function Add-DeviceToGroup
@@ -552,7 +432,7 @@ function Add-DeviceToGroup
     {
         Log-Message -Level INFO `
                     -Message "[WHATIF] Would add $DeviceId to group $GroupId." `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -InvocationName $MyInvocation.MyCommand.Name
         return
     }
 
@@ -568,7 +448,7 @@ function Add-DeviceToGroup
 
         Log-Message -Level INFO `
                     -Message "Successfully added $DeviceId to group $GroupId." `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -InvocationName $MyInvocation.MyCommand.Name
     }
     catch
     {
@@ -576,7 +456,7 @@ function Add-DeviceToGroup
         {
             Log-Message -Level DEBUG `
                         -Message "Device $DeviceId already a member (race condition — safe to ignore)." `
-                        -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                        -InvocationName $MyInvocation.MyCommand.Name
             return
         }
         throw
@@ -591,7 +471,7 @@ function Remove-DeviceFromGroup
     {
         Log-Message -Level INFO `
                     -Message "[WHATIF] Would remove $DeviceId from group $GroupId." `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -InvocationName $MyInvocation.MyCommand.Name
         return
     }
 
@@ -606,7 +486,7 @@ function Remove-DeviceFromGroup
 
         Log-Message -Level INFO `
                     -Message "Successfully removed $DeviceId from group $GroupId." `
-                    -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                    -InvocationName $MyInvocation.MyCommand.Name
     }
     catch
     {
@@ -614,27 +494,70 @@ function Remove-DeviceFromGroup
         {
             Log-Message -Level DEBUG `
                         -Message "Device $DeviceId already removed (safe to ignore)." `
-                        -InvocationName "$( $MyInvocation.MyCommand.Name )"
+                        -InvocationName $MyInvocation.MyCommand.Name
             return
         }
         throw
     }
 }
 
+function Get-AllGroupMembers
+{
+    param (
+        [Parameter(Mandatory)]
+        [string] $GroupId,
+
+        [Parameter(Mandatory)]
+        [string] $Token
+    )
+
+    $all = [System.Collections.Generic.List[pscustomobject]]::new()
+    $uri = "https://graph.microsoft.com/v1.0/groups/$GroupId/members?`$select=id,displayName&`$top=999"
+
+    do
+    {
+        $res = Invoke-WithRetry -OperationName "Get members ($GroupId)" -ScriptBlock {
+            Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $Token" }
+        }
+
+        if ($res.value)
+        {
+            foreach ($m in $res.value)
+            {
+                $all.Add([pscustomobject]@{
+                    Id          = $m.id
+                    DisplayName = if ($m.displayName) { $m.displayName } else { '(unknown)' }
+                })
+            }
+        }
+
+        $uri = if ($res.PSObject.Properties.Name -contains '@odata.nextLink')
+        {
+            $res.'@odata.nextLink'
+        }
+        else
+        {
+            $null
+        }
+    }
+    while ($uri)
+
+    Log-Message -Level INFO `
+        -Message "Fetched $($all.Count) member(s) for group $GroupId." `
+        -InvocationName 'Get-AllGroupMembers'
+
+    return $all.ToArray()
+}
+
 # ============================================================
-#  SUMMARY REPORT
+#  SUMMARY REPORT  (per-group aware)
 # ============================================================
 
 function Write-SyncSummary
 {
     param (
-        [string]   $GroupObjectId,
-        [string[]] $DeviceTags,
-        [object[]] $CurrentMembers,
-        [object[]] $AddedDevices,
-        [object[]] $RemovedDevices,
-        [object[]] $PendingDevices,
-        [int]      $ErrorCount
+        [object[]] $GroupResults,
+        [int]      $TotalErrors
     )
 
     $sep = '=' * 72
@@ -642,91 +565,100 @@ function Write-SyncSummary
     Write-Host ''
     Write-Host $sep                                           -ForegroundColor Cyan
     Write-Host '  SYNC SUMMARY REPORT'                       -ForegroundColor Cyan
-    Write-Host "  $( Get-Date -Format 'yyyy-MM-dd HH:mm:ss' )" -ForegroundColor Cyan
+    Write-Host "  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Cyan
+    Write-Host "  WhatIf Mode : $WhatIf"                     -ForegroundColor Cyan
     Write-Host $sep                                           -ForegroundColor Cyan
-    Write-Host ''
-    Write-Host "  Group Object ID  : $GroupObjectId"
-    Write-Host "  MDE Tag(s)       : $( $DeviceTags -join ', ' )"
-    Write-Host "  WhatIf Mode      : $WhatIf"
-    Write-Host ''
 
-    # Current members
-    Write-Host "  ALL CURRENT GROUP MEMBERS ($( $CurrentMembers.Count ))" -ForegroundColor Yellow
-    Write-Host "  $( '-' * 68 )"
-    if ($CurrentMembers.Count -eq 0)
+    foreach ($r in $GroupResults)
     {
-        Write-Host '    (none)' -ForegroundColor DarkGray
-    }
-    else
-    {
-        foreach ($m in ($CurrentMembers | Sort-Object DisplayName))
-        {
-            Write-Host ("    {0,-45} {1}" -f $m.DisplayName, $m.Id)
-        }
-    }
-
-    # Added
-    Write-Host ''
-    Write-Host "  ADDED THIS RUN ($( $AddedDevices.Count ))" -ForegroundColor Green
-    Write-Host "  $( '-' * 68 )"
-    if ($AddedDevices.Count -eq 0)
-    {
-        Write-Host '    (none — all resolved devices were already members)' -ForegroundColor DarkGray
-    }
-    else
-    {
-        foreach ($d in $AddedDevices)
-        {
-            Write-Host ("    {0,-45} {1}" -f $d.DisplayName, $d.Id) -ForegroundColor Green
-        }
-    }
-
-    # Removed
-    Write-Host ''
-    Write-Host "  REMOVED THIS RUN ($( $RemovedDevices.Count ))" -ForegroundColor Magenta
-    Write-Host "  $( '-' * 68 )"
-    if ($RemovedDevices.Count -eq 0)
-    {
-        Write-Host '    (none)' -ForegroundColor DarkGray
-    }
-    else
-    {
-        foreach ($d in $RemovedDevices)
-        {
-            Write-Host ("    {0,-45} {1}" -f $d.DisplayName, $d.Id) -ForegroundColor Magenta
-        }
-    }
-
-    # Pending (eventual consistency — not an error)
-    Write-Host ''
-    Write-Host "  PENDING ENTRA REGISTRATION ($( $PendingDevices.Count ))" -ForegroundColor Yellow
-    Write-Host "  $( '-' * 68 )"
-    if ($PendingDevices.Count -eq 0)
-    {
-        Write-Host '    (none)' -ForegroundColor DarkGray
-    }
-    else
-    {
-        Write-Host '    These devices exist in MDE but are not yet visible in Entra ID.' -ForegroundColor DarkGray
-        Write-Host '    This is expected during Intune/MDE synthetic registration.' -ForegroundColor DarkGray
-        Write-Host '    They will be added automatically on the next successful run.' -ForegroundColor DarkGray
         Write-Host ''
-        foreach ($d in $PendingDevices)
+        Write-Host "  GROUP : $($r.Name)"                    -ForegroundColor Cyan
+        Write-Host "  ID    : $($r.GroupId)"
+        Write-Host "  VAR   : $($r.SourceVar)"
+        Write-Host "  $('-' * 68)"
+
+        # ── Current members ──────────────────────────────────────────────────
+        Write-Host "  ALL CURRENT GROUP MEMBERS ($($r.FinalMembers.Count))" -ForegroundColor Yellow
+        if ($r.FinalMembers.Count -eq 0)
         {
-            Write-Host ("    {0}" -f $d) -ForegroundColor Yellow
+            Write-Host '    (none)' -ForegroundColor DarkGray
         }
+        else
+        {
+            foreach ($m in ($r.FinalMembers | Sort-Object DisplayName))
+            {
+                Write-Host ("    {0,-45} {1}" -f $m.DisplayName, $m.Id)
+            }
+        }
+
+        # ── Added ─────────────────────────────────────────────────────────────
+        Write-Host ''
+        Write-Host "  ADDED THIS RUN ($($r.Added.Count))" -ForegroundColor Green
+        if ($r.Added.Count -eq 0)
+        {
+            Write-Host '    (none — all resolved devices were already members)' -ForegroundColor DarkGray
+        }
+        else
+        {
+            foreach ($d in $r.Added)
+            {
+                Write-Host ("    {0,-45} {1}" -f $d.DisplayName, $d.Id) -ForegroundColor Green
+            }
+        }
+
+        # ── Removed ───────────────────────────────────────────────────────────
+        Write-Host ''
+        Write-Host "  REMOVED THIS RUN ($($r.Removed.Count))" -ForegroundColor Magenta
+        if ($r.Removed.Count -eq 0)
+        {
+            Write-Host '    (none)' -ForegroundColor DarkGray
+        }
+        else
+        {
+            foreach ($d in $r.Removed)
+            {
+                Write-Host ("    {0,-45} {1}" -f $d.DisplayName, $d.Id) -ForegroundColor Magenta
+            }
+        }
+
+        # ── Pending (propagation window — not an error) ───────────────────────
+        Write-Host ''
+        Write-Host "  PENDING ENTRA REGISTRATION ($($r.Pending.Count))" -ForegroundColor Yellow
+        if ($r.Pending.Count -eq 0)
+        {
+            Write-Host '    (none)' -ForegroundColor DarkGray
+        }
+        else
+        {
+            Write-Host '    Not yet visible in Entra ID. Will be added on next successful run.' -ForegroundColor DarkGray
+            foreach ($name in $r.Pending)
+            {
+                Write-Host "    $name" -ForegroundColor Yellow
+            }
+        }
+
+        # ── Skipped / ambiguous (resolution safety guard — not an error) ──────
+        Write-Host ''
+        Write-Host "  SKIPPED — AMBIGUOUS RESOLUTION ($($r.Skipped.Count))" -ForegroundColor Yellow
+        if ($r.Skipped.Count -eq 0)
+        {
+            Write-Host '    (none)' -ForegroundColor DarkGray
+        }
+        else
+        {
+            Write-Host '    Fuzzy match returned multiple candidates. Correct the device name in config.' -ForegroundColor DarkGray
+            foreach ($name in $r.Skipped)
+            {
+                Write-Host "    $name" -ForegroundColor Yellow
+            }
+        }
+
+        Write-Host "  $('-' * 68)"
     }
 
-    # Errors
     Write-Host ''
-    Write-Host "  NON-FATAL API ERRORS : $ErrorCount" -ForegroundColor $( if ($ErrorCount -gt 0)
-    {
-        'Red'
-    }
-    else
-    {
-        'DarkGray'
-    } )
+    Write-Host "  TOTAL API ERRORS : $TotalErrors" `
+        -ForegroundColor $(if ($TotalErrors -gt 0) { 'Red' } else { 'DarkGray' })
     Write-Host ''
     Write-Host $sep -ForegroundColor Cyan
     Write-Host ''
@@ -737,252 +669,271 @@ function Write-SyncSummary
 # ============================================================
 
 Log-Message -Level INFO `
-            -Message "========== Sync started | Tags: '$( $DeviceTag -join "', '" )' | OS: '$( $OsPlatforms -join "', '" )' | Group: '$EntraGroupObjectId' | RemoveStale: $RemoveStaleMembers | ForceRemove: $( $ForceRemoveDeviceIds.Count ) ID(s) | WhatIf: $WhatIf ==========" `
+            -Message "========== Sync started | Variables: '$($AutomationVariableNames -join "', '")' | DefaultRemoveStale: $DefaultRemoveStale | WhatIf: $WhatIf ==========" `
             -InvocationName 'MAIN'
 
-$addedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
-$removedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
-$pendingDevices = [System.Collections.Generic.List[string]]::new()
+# ── Auth ─────────────────────────────────────────────────────────────────────
 
-# --- Auth ---
 Initialize-ManagedIdentityAuth
-
-# --- Tokens ---
 $graphToken = Get-AccessToken -Resource 'https://graph.microsoft.com'
-$mdeToken = Get-AccessToken -Resource 'https://api.securitycenter.microsoft.com'
 
-# --- MDE devices ---
-$mdeDevices = Get-MdeDevicesByTag `
-    -Tags         $DeviceTag `
-    -Token        $mdeToken `
-    -OsPlatforms  $OsPlatforms `
-    -HealthStatus $HealthStatus
+# ── Load and validate group configs ──────────────────────────────────────────
 
-# --- Current group members (needed by both normal sync and force-remove) ---
-$currentRaw = Invoke-WithRetry -OperationName 'Get current group members' -ScriptBlock {
-    Invoke-RestMethod `
-        -Uri     "https://graph.microsoft.com/v1.0/groups/$EntraGroupObjectId/members?`$select=id,displayName" `
-        -Headers @{ Authorization = "Bearer $graphToken" }
-}
+$groupConfigs = [System.Collections.Generic.List[pscustomobject]]::new()
 
-$currentMembers = @($currentRaw.value) | ForEach-Object {
-    [pscustomobject]@{
-        Id = $_.id
-        DisplayName = if ($_.displayName)
+foreach ($varName in $AutomationVariableNames)
+{
+    try
+    {
+        Log-Message -Level INFO `
+                    -Message "Loading config from Automation Variable: '$varName'" `
+                    -InvocationName 'MAIN'
+
+        $raw = Get-AutomationVariable -Name $varName
+
+        if (-not $raw)
         {
-            $_.displayName
+            Log-Message -Level ERROR `
+                        -Message "Variable '$varName' is null or empty." `
+                        -InvocationName 'MAIN'
+            $script:SyncErrorCount++
+            continue
+        }
+
+        $cfg = $raw | ConvertFrom-Json
+
+        if (-not $cfg.groupId)
+        {
+            Log-Message -Level ERROR `
+                        -Message "Variable '$varName' is missing required field 'groupId'." `
+                        -InvocationName 'MAIN'
+            $script:SyncErrorCount++
+            continue
+        }
+
+        if (-not $cfg.devices -or @($cfg.devices).Count -eq 0)
+        {
+            Log-Message -Level ERROR `
+                        -Message "Variable '$varName' is missing required field 'devices' (or is an empty array)." `
+                        -InvocationName 'MAIN'
+            $script:SyncErrorCount++
+            continue
+        }
+
+        # Per-group removeStale overrides the global default; absence means use default.
+        $removeStale = if ($null -ne $cfg.PSObject.Properties['removeStale'])
+        {
+            [bool]$cfg.removeStale
         }
         else
         {
-            '(unknown)'
+            $DefaultRemoveStale
         }
+
+        $displayName = if ($cfg.name) { $cfg.name } else { $cfg.groupId }
+
+        $groupConfigs.Add([pscustomobject]@{
+            GroupId     = $cfg.groupId
+            Name        = $displayName
+            Devices     = [string[]]$cfg.devices
+            RemoveStale = $removeStale
+            SourceVar   = $varName
+        })
+
+        Log-Message -Level INFO `
+                    -Message "Loaded group '$displayName' from '$varName' ($($cfg.devices.Count) device(s), removeStale=$removeStale)." `
+                    -InvocationName 'MAIN'
+    }
+    catch
+    {
+        Log-Message -Level ERROR `
+                    -Message "Failed to load/parse variable '$varName': $($_.Exception.Message)" `
+                    -InvocationName 'MAIN'
+        $script:SyncErrorCount++
     }
 }
-$currentIds = @($currentMembers | Select-Object -ExpandProperty Id)
 
-# --- Early exit if MDE returned no devices ---
-# Only exit early if RemoveStaleMembers is false and no ForceRemoveDeviceIds are supplied.
-# If RemoveStaleMembers is true, an empty MDE result is a valid desired state of
-# "nothing should be in the group" — stale removal must still run to honour that.
-if (@($mdeDevices).Count -eq 0 -and @($ForceRemoveDeviceIds).Count -eq 0 -and -not $RemoveStaleMembers)
+if ($groupConfigs.Count -eq 0)
 {
-    Log-Message -Level WARN `
-                -Message "MDE returned 0 devices for tag(s): '$( $DeviceTag -join "', '" )'. Auth is working. Nothing to sync." `
+    throw "No valid group configs could be loaded. Check Automation Variables. Total parse errors: $script:SyncErrorCount"
+}
+
+Log-Message -Level INFO `
+            -Message "Loaded $($groupConfigs.Count) valid group config(s). $($AutomationVariableNames.Count - $groupConfigs.Count) skipped due to errors." `
+            -InvocationName 'MAIN'
+
+# ── Build Entra device index (single Graph call, replaces per-device lookups) ─
+
+$deviceIndex, $fuzzyList = Build-DeviceIndex -GraphToken $graphToken
+
+# ── Process each group ────────────────────────────────────────────────────────
+
+$groupResults = [System.Collections.Generic.List[pscustomobject]]::new()
+
+foreach ($groupCfg in $groupConfigs)
+{
+    $groupId     = $groupCfg.GroupId
+    $groupName   = $groupCfg.Name
+    $removeStale = $groupCfg.RemoveStale
+
+    Log-Message -Level INFO `
+                -Message "--- Processing group '$groupName' ($groupId) | configuredDevices: $($groupCfg.Devices.Count) | removeStale: $removeStale ---" `
                 -InvocationName 'MAIN'
 
-    $sep = '=' * 72
-    Write-Host ''
-    Write-Host $sep                                           -ForegroundColor Cyan
-    Write-Host '  SYNC SUMMARY REPORT'                       -ForegroundColor Cyan
-    Write-Host "  $( Get-Date -Format 'yyyy-MM-dd HH:mm:ss' )" -ForegroundColor Cyan
-    Write-Host $sep                                           -ForegroundColor Cyan
-    Write-Host ''
-    Write-Host "  Group Object ID  : $EntraGroupObjectId"
-    Write-Host "  MDE Tag(s)       : $( $DeviceTag -join ', ' )"
-    Write-Host "  WhatIf Mode      : $WhatIf"
-    Write-Host ''
-    Write-Host '  AUTH              : OK'                                                   -ForegroundColor Green
-    Write-Host '  MDE DEVICES FOUND : 0 — no devices match the tag(s) and OS filter yet.'  -ForegroundColor Yellow
-    Write-Host '  MEMBERS ADDED     : 0'
-    Write-Host '  MEMBERS REMOVED   : 0'
-    Write-Host '  PENDING           : 0'
-    Write-Host '  API ERRORS        : 0'                                                    -ForegroundColor DarkGray
-    Write-Host ''
-    Write-Host $sep -ForegroundColor Cyan
-    Write-Host ''
+    $addedDevices   = [System.Collections.Generic.List[pscustomobject]]::new()
+    $removedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
+    $pendingDevices = [System.Collections.Generic.List[string]]::new()
+    $skippedDevices = [System.Collections.Generic.List[string]]::new()
 
-    exit 0
-}
+    # ── Get current group members ─────────────────────────────────────────────
 
-# --- Resolve Entra Object IDs for MDE devices ---
-$resolved = [System.Collections.Generic.List[pscustomobject]]::new()
+    $currentMembers = Get-AllGroupMembers -GroupId $groupId -Token $graphToken
+    $currentIds = @($currentMembers | Select-Object -ExpandProperty Id)
 
-foreach ($d in $mdeDevices)
-{
-    $id = Resolve-EntraDeviceId -Device $d -GraphToken $graphToken
+    # ── Resolve desired devices via index ─────────────────────────────────────
 
-    if ($id)
+    $resolvedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
+
+    foreach ($deviceName in $groupCfg.Devices)
     {
-        $resolved.Add([pscustomobject]@{
-            Id = $id
-            DisplayName = $d.computerDnsName
-        })
-    }
-    else
-    {
-        # Not an error — device is pending Intune/MDE synthetic registration in Entra.
-        # Track separately so the summary shows it and the job does not fail.
-        $script:PendingCount++
-        $pendingDevices.Add($d.computerDnsName)
-        Log-Message -Level WARN `
-                    -Message "'$( $d.computerDnsName )' not yet in Entra ID (pending registration). Will retry next run." `
-                    -InvocationName 'MAIN'
-    }
-}
+        $result = Resolve-Device `
+            -DeviceName   $deviceName `
+            -DeviceIndex  $deviceIndex `
+            -FuzzyList    $fuzzyList
 
-# --- Add missing devices ---
-foreach ($device in $resolved)
-{
-    if ($currentIds -notcontains $device.Id)
-    {
-        try
+        switch ($result.Status)
         {
-            Add-DeviceToGroup -GroupId $EntraGroupObjectId -DeviceId $device.Id -Token $graphToken
-            $addedDevices.Add($device)
-            Log-Message -Level INFO `
-                        -Message "Added '$( $device.DisplayName )' ($( $device.Id )) to group." `
-                        -InvocationName 'MAIN'
-        }
-        catch
-        {
-            $script:SyncErrorCount++
-            Log-Message -Level ERROR `
-                        -Message "Failed to add '$( $device.DisplayName )' ($( $device.Id )): $( $_.Exception.Message )" `
-                        -InvocationName 'MAIN'
+            'Resolved'
+            {
+                $resolvedDevices.Add([pscustomobject]@{
+                    Id          = $result.Id
+                    DisplayName = $deviceName
+                })
+            }
+            'Pending'
+            {
+                $script:PendingCount++
+                $pendingDevices.Add($deviceName)
+                Log-Message -Level WARN `
+                            -Message "'$deviceName' not yet in Entra — pending registration. Will retry next run." `
+                            -InvocationName 'MAIN'
+            }
+            'Ambiguous'
+            {
+                # Ambiguous is not a pending state — the config name needs fixing.
+                # Tracked separately so it's visible in the summary without inflating errors.
+                $skippedDevices.Add($deviceName)
+                Log-Message -Level WARN `
+                            -Message "'$deviceName' skipped — ambiguous fuzzy match. Correct the name in '$($groupCfg.SourceVar)'." `
+                            -InvocationName 'MAIN'
+            }
         }
     }
-    else
-    {
-        Log-Message -Level DEBUG `
-                    -Message "'$( $device.DisplayName )' already in group. Skipping." `
-                    -InvocationName 'MAIN'
-    }
-}
 
-# --- Remove stale members ---
-# A device is stale if it is in the group but no longer appears in the MDE query results.
-# The MDE query already excludes isExcluded devices, so offboarded devices naturally
-# fall out of $resolved and get removed here when RemoveStaleMembers is enabled.
-# Please note: The force removal basically isn't working at all, I have tried adding a top level try-catch and guarding the DeviceIds, but get exception errors.
-# Don't use the force device IDs method, just let InTune handle it, and if you must, use the non-forced IDs to try and reconcile, that code doesn't hit an exception
-if ($RemoveStaleMembers)
-{
-    $resolvedIds = @($resolved | Select-Object -ExpandProperty Id)
+    $resolvedIds = @($resolvedDevices | Select-Object -ExpandProperty Id)
 
-    foreach ($member in $currentMembers)
+    # ── Add missing devices ───────────────────────────────────────────────────
+
+    foreach ($device in $resolvedDevices)
     {
-        if ($resolvedIds -notcontains $member.Id)
+        if ($currentIds -notcontains $device.Id)
         {
             try
             {
-                Remove-DeviceFromGroup -GroupId $EntraGroupObjectId -DeviceId $member.Id -Token $graphToken
-                $removedDevices.Add($member)
+                Add-DeviceToGroup -GroupId $groupId -DeviceId $device.Id -Token $graphToken
+                $addedDevices.Add($device)
                 Log-Message -Level INFO `
-                            -Message "Removed stale '$( $member.DisplayName )' ($( $member.Id )) from group." `
+                            -Message "Added '$($device.DisplayName)' ($($device.Id)) to '$groupName'." `
                             -InvocationName 'MAIN'
             }
             catch
             {
                 $script:SyncErrorCount++
                 Log-Message -Level ERROR `
-                            -Message "Failed to remove '$( $member.DisplayName )' ($( $member.Id )): $( $_.Exception.Message )" `
+                            -Message "Failed to add '$($device.DisplayName)' ($($device.Id)) to '$groupName': $($_.Exception.Message)" `
                             -InvocationName 'MAIN'
             }
         }
-    }
-}
-
-# --- Force remove (manual override) ---
-# Explicitly removes specific Entra device Object IDs regardless of tag or MDE state.
-# Use when MDE API lag prevents automatic stale removal of known-offboarded devices.
-# Uses the pre-change $currentIds snapshot — consistent with the rest of MAIN.
-if (@($ForceRemoveDeviceIds).Count -gt 0)
-{
-    Log-Message -Level INFO `
-                -Message "Force-remove override: $( $ForceRemoveDeviceIds.Count ) device ID(s) supplied." `
-                -InvocationName 'MAIN'
-
-    foreach ($forceId in $ForceRemoveDeviceIds)
-    {
-        if ($currentIds -notcontains $forceId)
-        {
-            Log-Message -Level INFO `
-                        -Message "Force-remove: '$forceId' is not in the group — nothing to do." `
-                        -InvocationName 'MAIN'
-            continue
-        }
-
-        try
-        {
-            Remove-DeviceFromGroup -GroupId $EntraGroupObjectId -DeviceId $forceId -Token $graphToken
-            $removedDevices.Add([pscustomobject]@{
-                Id = $forceId
-                DisplayName = "(force-removed)"
-            })
-            Log-Message -Level INFO `
-                        -Message "Force-remove: successfully removed '$forceId' from group." `
-                        -InvocationName 'MAIN'
-        }
-        catch
-        {
-            $script:SyncErrorCount++
-            Log-Message -Level ERROR `
-                        -Message "Force-remove: failed to remove '$forceId': $( $_.Exception.Message )" `
-                        -InvocationName 'MAIN'
-        }
-    }
-}
-
-# --- Final member list (post-change) ---
-$finalRaw = Invoke-WithRetry -OperationName 'Get final group members' -ScriptBlock {
-    Invoke-RestMethod `
-        -Uri     "https://graph.microsoft.com/v1.0/groups/$EntraGroupObjectId/members?`$select=id,displayName" `
-        -Headers @{ Authorization = "Bearer $graphToken" }
-}
-
-$finalMembers = @($finalRaw.value) | ForEach-Object {
-    [pscustomobject]@{
-        Id = $_.id
-        DisplayName = if ($_.displayName)
-        {
-            $_.displayName
-        }
         else
         {
-            '(unknown)'
+            Log-Message -Level DEBUG `
+                        -Message "'$($device.DisplayName)' already in '$groupName'. Skipping." `
+                        -InvocationName 'MAIN'
         }
     }
+
+    # ── Remove stale members ──────────────────────────────────────────────────
+    # A member is stale if it is in the group but not in $resolvedIds.
+    # Only runs when removeStale is enabled for this group.
+    # Note: pending and ambiguous devices are NOT in $resolvedIds — they are intentionally
+    # excluded from the desired state and will not trigger removal of existing members.
+    # This is the safe default. If you want stale removal to be definitive, ensure all
+    # devices in the config are resolvable before enabling removeStale.
+
+    if ($removeStale)
+    {
+        foreach ($member in $currentMembers)
+        {
+            if ($resolvedIds -notcontains $member.Id)
+            {
+                try
+                {
+                    Remove-DeviceFromGroup -GroupId $groupId -DeviceId $member.Id -Token $graphToken
+                    $removedDevices.Add($member)
+                    Log-Message -Level INFO `
+                                -Message "Removed stale '$($member.DisplayName)' ($($member.Id)) from '$groupName'." `
+                                -InvocationName 'MAIN'
+                }
+                catch
+                {
+                    $script:SyncErrorCount++
+                    Log-Message -Level ERROR `
+                                -Message "Failed to remove '$($member.DisplayName)' ($($member.Id)) from '$groupName': $($_.Exception.Message)" `
+                                -InvocationName 'MAIN'
+                }
+            }
+        }
+    }
+
+    # ── Final member list (post-change) ──────────────────────────────────────
+
+    $finalMembers = Get-AllGroupMembers -GroupId $groupId -Token $graphToken
+
+    Log-Message -Level INFO `
+            -Message "Group '$groupName' complete | Added: $($addedDevices.Count) | Removed: $($removedDevices.Count) | Pending: $($pendingDevices.Count) | Skipped: $($skippedDevices.Count)" `
+            -InvocationName 'MAIN'
+
+    $groupResults.Add([pscustomobject]@{
+        GroupId      = $groupId
+        Name         = $groupName
+        SourceVar    = $groupCfg.SourceVar
+        Added        = $addedDevices.ToArray()
+        Removed      = $removedDevices.ToArray()
+        Pending      = $pendingDevices.ToArray()
+        Skipped      = $skippedDevices.ToArray()
+        FinalMembers = $finalMembers
+    })
 }
 
+# ── Overall summary ───────────────────────────────────────────────────────────
+
+$totalAdded   = ($groupResults | ForEach-Object { $_.Added.Count }   | Measure-Object -Sum).Sum
+$totalRemoved = ($groupResults | ForEach-Object { $_.Removed.Count } | Measure-Object -Sum).Sum
+
 Log-Message -Level INFO `
-            -Message "========== Sync complete | Added: $( $addedDevices.Count ) | Removed: $( $removedDevices.Count ) | Pending: $script:PendingCount | API Errors: $script:SyncErrorCount ==========" `
+            -Message "========== Sync complete | Groups: $($groupResults.Count) | Added: $totalAdded | Removed: $totalRemoved | Pending: $script:PendingCount | API Errors: $script:SyncErrorCount ==========" `
             -InvocationName 'MAIN'
 
 Write-SyncSummary `
-    -GroupObjectId  $EntraGroupObjectId `
-    -DeviceTags     $DeviceTag `
-    -CurrentMembers @($finalMembers) `
-    -AddedDevices   @($addedDevices) `
-    -RemovedDevices @($removedDevices) `
-    -PendingDevices @($pendingDevices) `
-    -ErrorCount     $script:SyncErrorCount
+    -GroupResults @($groupResults) `
+    -TotalErrors  $script:SyncErrorCount
 
-# ── Failure alerting ─────────────────────────────────────────────────────────
-# Only throw if genuine API errors occurred (not pending devices).
-# This causes the Azure Automation 'Total Jobs / Failed' metric to increment,
-# triggering the Azure Monitor alert rule.
-# Pending devices (eventual consistency) produce a Completed job — no alert fires.
+# ── Failure alerting ──────────────────────────────────────────────────────────
+# Only throw for genuine API errors — increments the Azure Automation Failed Jobs
+# metric and triggers Azure Monitor alerting.
+# Pending and ambiguous devices produce a Completed job (no alert).
+
 if ($script:SyncErrorCount -gt 0)
 {
-    throw "Sync finished with $script:SyncErrorCount API error(s). Review job output above. ($script:PendingCount device(s) pending Entra registration — these are normal and will retry.)"
+    throw "Sync finished with $script:SyncErrorCount API error(s). Review job output above. ($script:PendingCount device(s) pending Entra registration — these will retry automatically.)"
 }

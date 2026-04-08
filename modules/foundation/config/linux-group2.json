@@ -1,0 +1,9 @@
+{
+  "groupId": "8757808e-c4e8-4898-bd26-732ce42018be",
+  "name": "linux-group2",
+  "removeStale": true,
+  "devices": [
+    "lnx-server03.contoso.local",
+    "lnx-server04.contoso.local"
+  ]
+}

@@ -45,12 +45,13 @@ module "automation_account" {
   identity_ids  = [module.user_assigned_managed_identity.managed_identity_ids[module.shared_vars.foundation_uid_name]]
 }
 
-data "azuread_service_principal" "graph" {
-  client_id = "00000003-0000-0000-c000-000000000000" # MSGraph in-built SPN
-}
+# ---------------------------------------------------------------------------
+#  GRAPH SERVICE PRINCIPAL
+#  WindowsDefenderATP is no longer required — MDE dependency removed.
+# ---------------------------------------------------------------------------
 
-data "azuread_service_principal" "defender" {
-  client_id = "fc780465-2017-40d4-a0c5-307022471b92" # WindowsATP in-built SPN
+data "azuread_service_principal" "graph" {
+  client_id = "00000003-0000-0000-c000-000000000000" # MSGraph built-in SPN
 }
 
 data "azuread_service_principal" "mi" {
@@ -79,27 +80,62 @@ resource "azuread_app_role_assignment" "graph_group_rw" {
   ])
 }
 
-resource "azuread_app_role_assignment" "defender_machine_read" {
-  principal_object_id = data.azuread_service_principal.mi.object_id
-  resource_object_id  = data.azuread_service_principal.defender.object_id
+# ---------------------------------------------------------------------------
+#  GROUP SYNC CONFIG — one JSON file per group, loaded as Automation Variables
+#
+#  File layout expected:  ${path.module}/configs/<key>.json
+#  Variable name in AA:   GroupConfig-<key>
+#
+#  To add or remove a group: edit the map below and re-apply.
+#  The variable names passed to the runbook are derived automatically.
+# ---------------------------------------------------------------------------
 
-  app_role_id = one([
-    for role in data.azuread_service_principal.defender.app_roles :
-    role.id if role.value == "Machine.Read.All"
+locals {
+  group_configs = {
+    for k, v in {
+      linux-group1 = "${path.module}/configs/linux-group1.json"
+      linux-group2 = "${path.module}/configs/linux-group2.json"
+      linux-group3 = "${path.module}/configs/linux-group3.json"
+      linux-group4 = "${path.module}/configs/linux-group4.json"
+      linux-group5 = "${path.module}/configs/linux-group5.json"
+      linux-group6 = "${path.module}/configs/linux-group6.json"
+    } :
+    k => jsonencode(jsondecode(file(v)))
+  }
+
+  # Produces the comma-separated string passed to the [string[]] runbook parameter.
+  # Azure Automation splits on commas when binding job schedule parameters to arrays.
+  automation_variable_names = join(",", [
+    for k in sort(keys(local.group_configs)) : trimspace("GroupConfig-${k}")
   ])
 }
+
+resource "azurerm_automation_variable_string" "group_config" {
+  for_each = local.group_configs
+
+  resource_group_name     = module.rg.rg_name
+  automation_account_name = module.automation_account.aa_name
+
+  name        = "GroupConfig-${each.key}"
+  value       = each.value
+  encrypted   = false
+  description = "Device sync config for Entra group: ${each.key}"
+}
+
+# ---------------------------------------------------------------------------
+#  DEBUG RUNTIME + RUNBOOK  (unchanged)
+# ---------------------------------------------------------------------------
 
 resource "azurerm_automation_runtime_environment" "ps72_debug" {
   automation_account_id = module.automation_account.aa_id
   location              = module.rg.rg_location
 
-  #Only 3 tags are allowed
+  # Only 3 tags are allowed on runtime environments
   tags = {
     ContactEmail   = lookup(module.shared_vars.tags, "ContactEmail", null)
     Classification = lookup(module.shared_vars.tags, "Classification", null)
     CostCenter     = lookup(module.shared_vars.tags, "CostCenter", null)
   }
-
 
   name             = "Debug-Pwsh72-Runtime"
   runtime_language = "PowerShell"
@@ -129,6 +165,57 @@ resource "azurerm_automation_runbook" "runbook_debug" {
   content = file("${path.module}/scripts/debug/Debug.ps1")
 }
 
+# ---------------------------------------------------------------------------
+#  SYNC RUNTIME + RUNBOOK
+# ---------------------------------------------------------------------------
+
+resource "azurerm_automation_runtime_environment" "ps72_group_sync" {
+  automation_account_id = module.automation_account.aa_id
+  location              = module.rg.rg_location
+
+  # Only 3 tags are allowed on runtime environments
+  tags = {
+    ContactEmail   = lookup(module.shared_vars.tags, "ContactEmail", null)
+    Classification = lookup(module.shared_vars.tags, "Classification", null)
+    CostCenter     = lookup(module.shared_vars.tags, "CostCenter", null)
+  }
+
+  name             = "GroupSync-Pwsh72-Runtime"
+  runtime_language = "PowerShell"
+  runtime_version  = "7.2"
+
+  runtime_default_packages = {
+    "az" = "11.2.0"
+  }
+
+  description = "Group sync runtime for PowerShell 7.2"
+}
+
+resource "azurerm_automation_runbook" "runbook_group_sync" {
+  resource_group_name = module.rg.rg_name
+  location            = module.rg.rg_location
+  tags                = module.rg.rg_tags
+
+  automation_account_name = module.automation_account.aa_name
+  name                    = module.shared_vars.foundation_mde_sync_automation_runbook_name
+
+  runbook_type             = "PowerShell"
+  runtime_environment_name = azurerm_automation_runtime_environment.ps72_group_sync.name
+  log_verbose              = true
+  log_progress             = true
+  description              = "Sync explicitly-configured devices into Entra ID security groups"
+
+  # Runbook reads group membership from Automation Variables — no MDE dependency.
+  content = file("${path.module}/scripts/sync/Sync-EntraGroupsFromConfig.ps1")
+
+  # Variables must exist before the runbook runs — enforce ordering.
+  depends_on = [azurerm_automation_variable_string.group_config]
+}
+
+# ---------------------------------------------------------------------------
+#  SCHEDULE  (shared 60-min schedule)
+# ---------------------------------------------------------------------------
+
 resource "azurerm_automation_schedule" "every_60_min" {
   resource_group_name = module.shared_vars.foundation_rg_name
 
@@ -148,65 +235,35 @@ resource "azurerm_automation_job_schedule" "runbook_schedule_debug" {
   runbook_name  = azurerm_automation_runbook.runbook_debug.name
   schedule_name = azurerm_automation_schedule.every_60_min.name
 
-  #Due to a bug in the implementation of Runbooks in Azure, the parameter names need to be specified in lowercase only. See: "https://github.com/Azure/azure-sdk-for-go/issues/4780" for more information
+  # Parameter names must be lowercase — Azure SDK limitation.
+  # See: https://github.com/Azure/azure-sdk-for-go/issues/4780
   parameters = {
     managedidentityclientid = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
   }
 }
 
-resource "azurerm_automation_runtime_environment" "ps72_mde_sync" {
-  automation_account_id = module.automation_account.aa_id
-  location              = module.rg.rg_location
-
-  #Only 3 tags are allowed
-  tags = {
-    ContactEmail   = lookup(module.shared_vars.tags, "ContactEmail", null)
-    Classification = lookup(module.shared_vars.tags, "Classification", null)
-    CostCenter     = lookup(module.shared_vars.tags, "CostCenter", null)
-  }
-
-
-  name             = "MDE-Sync-Pwsh72-Runtime"
-  runtime_language = "PowerShell"
-  runtime_version  = "7.2"
-
-  runtime_default_packages = {
-    "az" = "11.2.0"
-  }
-
-  description = "MDE Sync runtime for PowerShell 7.2"
-}
-
-resource "azurerm_automation_runbook" "runbook_mde_sync" {
-  resource_group_name = module.rg.rg_name
-  location            = module.rg.rg_location
-  tags                = module.rg.rg_tags
-
-  automation_account_name = module.automation_account.aa_name
-  name                    = module.shared_vars.foundation_mde_sync_automation_runbook_name
-
-  runbook_type             = "PowerShell"
-  runtime_environment_name = azurerm_automation_runtime_environment.ps72_mde_sync.name
-  log_verbose              = true
-  log_progress             = true
-  description              = "Sync MDE devices to Entra Group"
-
-  content = file("${path.module}/scripts/sync/Sync-MDELinuxDeviceToEntra.ps1")
-}
-
-resource "azurerm_automation_job_schedule" "runbook_schedule_mde_sync" {
+resource "azurerm_automation_job_schedule" "runbook_schedule_group_sync" {
   resource_group_name = module.shared_vars.foundation_rg_name
 
   automation_account_name = module.automation_account.aa_name
 
-  runbook_name  = azurerm_automation_runbook.runbook_mde_sync.name
+  runbook_name  = azurerm_automation_runbook.runbook_group_sync.name
   schedule_name = azurerm_automation_schedule.every_60_min.name
 
-  #Due to a bug in the implementation of Runbooks in Azure, the parameter names need to be specified in lowercase only. See: "https://github.com/Azure/azure-sdk-for-go/issues/4780" for more information
+  # Parameter names must be lowercase — Azure SDK limitation.
+  # [string[]] parameters are passed as a comma-separated string; Azure Automation
+  # splits on commas when binding to the array parameter in the runbook.
   parameters = {
-    managedidentityclientid = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
+    managedidentityclientid  = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
+    automationvariablenames  = local.automation_variable_names
+    defaultremovestale       = "true"
+    whatif                   = "false"
   }
 }
+
+# ---------------------------------------------------------------------------
+#  ALERTING  (unchanged — still fires on failed jobs from the same runbook name)
+# ---------------------------------------------------------------------------
 
 resource "azurerm_monitor_action_group" "mde_sync_alerts" {
   name                = "ag-mde-sync-alerts"
@@ -230,7 +287,7 @@ resource "azurerm_monitor_metric_alert" "mde_sync_failed_jobs" {
     module.automation_account.aa_id
   ]
 
-  description = "Alert when Sync-MdeDevicesToEntraGroup runbook has failed jobs"
+  description = "Alert when the group sync runbook has failed jobs"
 
   severity    = 2
   frequency   = "PT5M"
@@ -246,7 +303,7 @@ resource "azurerm_monitor_metric_alert" "mde_sync_failed_jobs" {
     dimension {
       name     = "Runbook"
       operator = "Include"
-      values   = ["Sync-MdeDevicesToEntraGroup"]
+      values   = [module.shared_vars.foundation_mde_sync_automation_runbook_name]
     }
 
     dimension {
