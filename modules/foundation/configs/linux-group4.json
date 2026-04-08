@@ -2,8 +2,5 @@
   "groupId": "3f3da007-2c4c-4373-8a7a-6cc6fb8267b0\n",
   "name": "linux-group4",
   "removeStale": true,
-  "devices": [
-    "lnx-server07.contoso.local",
-    "lnx-server08.contoso.local"
-  ]
+  "devices": []
 }
