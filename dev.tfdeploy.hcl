@@ -24,5 +24,5 @@ deployment "dev" {
     rbac_client_id  = store.varset.shared.rbac_client_id
     write_client_id = store.varset.shared.write_client_id
   }
-  destroy = true
+  destroy = false
 }
