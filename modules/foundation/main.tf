@@ -132,7 +132,8 @@ locals {
     k if !(
       can(v.groupId) &&
       can(v.devices) &&
-      type(v.devices) == list(string)
+      can(length(v.devices)) &&
+      can([for d in v.devices : tostring(d)])
     )
   ]
 
