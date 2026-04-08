@@ -133,13 +133,13 @@ function Log-Message
             Write-Verbose "$prefix $Message"
         }                          # All Logs only — low-level detail
         'INFO'  {
-            Write-Host   "$prefix $Message" -ForegroundColor Green
+            Write-Verbose   "$prefix $Message"
         }  # Always visible — operational steps
         'WARN'  {
             Write-Warning "$prefix $Message"
         }                          # Warnings tab + All Logs
         'ERROR' {
-            Write-Host   "$prefix $Message" -ForegroundColor Red
+            Write-Error   "$prefix $Message"
         }  # Always visible — failures
     }
 }
@@ -190,6 +190,37 @@ function NormalizeVariableNames
         -InvocationName $MyInvocation.MyCommand.Name
 
     return $Names
+}
+
+function Sanitize-InputString
+{
+    param (
+        [Parameter(Mandatory)]
+        [string] $Value
+    )
+
+    if (-not $Value) { return $Value }
+
+    $original = $Value
+
+    # Trim whitespace first
+    $Value = $Value.Trim()
+
+    # Remove escaped quotes first (\" → ")
+    $Value = $Value -replace '\\\"', '"'
+
+    # Remove wrapping quotes repeatedly (handles ""value"" cases)
+    while ($Value.StartsWith('"') -and $Value.EndsWith('"'))
+    {
+        $Value = $Value.Substring(1, $Value.Length - 2).Trim()
+    }
+
+    if ($original -ne $Value)
+    {
+        Write-Verbose "Sanitized input: '$original' → '$Value'"
+    }
+
+    return $Value
 }
 
 # ============================================================
@@ -682,6 +713,8 @@ try
     # ── Normalise variable names ──────────────────────────────────────────────
     # Called here (inside try) not at script scope. If it throws, the catch
     # below writes the exception to Write-Host before re-throwing.
+    $ManagedIdentityClientId = Sanitize-InputString -Value $ManagedIdentityClientId
+    $AutomationVariableNames = Sanitize-InputString -Value $AutomationVariableNames
     $AutomationVariableNames = NormalizeVariableNames -Names $AutomationVariableNames
 
     Log-Message -Level INFO `

@@ -92,7 +92,7 @@ resource "azuread_app_role_assignment" "graph_group_rw" {
 # ---------------------------------------------------------------------------
 
 locals {
-  group_configs = {
+  raw_group_configs = {
     for k, v in {
       linux-group1 = "${path.module}/configs/linux-group1.json"
       linux-group2 = "${path.module}/configs/linux-group2.json"
@@ -101,14 +101,134 @@ locals {
       linux-group5 = "${path.module}/configs/linux-group5.json"
       linux-group6 = "${path.module}/configs/linux-group6.json"
     } :
-    k => jsonencode(jsondecode(file(v)))
+    k => jsondecode(file(v))
   }
 
-  # Produces the comma-separated string passed to the [string[]] runbook parameter.
-  # Azure Automation splits on commas when binding job schedule parameters to arrays.
+  # ────────────────────────────────────────────────────────────
+  # DUPLICATE DEVICES (per group, with values)
+  # ────────────────────────────────────────────────────────────
+
+  duplicate_devices = {
+    for k, v in local.raw_group_configs :
+    k => distinct([
+      for d in v.devices :
+      d if length([
+        for x in v.devices : x if x == d
+      ]) > 1
+    ])
+  }
+
+  duplicate_device_groups = {
+    for k, v in local.duplicate_devices :
+    k => v if length(v) > 0
+  }
+
+  # ────────────────────────────────────────────────────────────
+  # INVALID SCHEMA
+  # ────────────────────────────────────────────────────────────
+
+  invalid_schema_configs = [
+    for k, v in local.raw_group_configs :
+    k if !(
+      can(v.groupId) &&
+      can(v.devices) &&
+      type(v.devices) == list(string)
+    )
+  ]
+
+  # ────────────────────────────────────────────────────────────
+  # EMPTY DEVICE LISTS
+  # ────────────────────────────────────────────────────────────
+
+  empty_device_configs = [
+    for k, v in local.raw_group_configs :
+    k if length(v.devices) == 0
+  ]
+
+  # ────────────────────────────────────────────────────────────
+  # DUPLICATE GROUP IDS (with mapping)
+  # ────────────────────────────────────────────────────────────
+
+  group_ids = [
+    for k, v in local.raw_group_configs : {
+      key     = k
+      groupId = v.groupId
+    }
+  ]
+
+  duplicate_group_ids = distinct([
+    for g in local.group_ids :
+    g.groupId if length([
+      for x in local.group_ids : x if x.groupId == g.groupId
+    ]) > 1
+  ])
+
+  duplicate_group_id_map = {
+    for gid in local.duplicate_group_ids :
+    gid => [
+      for g in local.group_ids :
+      g.key if g.groupId == gid
+    ]
+  }
+
+  # ────────────────────────────────────────────────────────────
+  # FINAL ENCODED CONFIG (used by resources)
+  # ────────────────────────────────────────────────────────────
+
+  group_configs = {
+    for k, v in local.raw_group_configs :
+    k => jsonencode(v)
+  }
+
+  # ────────────────────────────────────────────────────────────
+  # RUNBOOK PARAM STRING
+  # ────────────────────────────────────────────────────────────
+
   automation_variable_names = join(",", [
     for k in sort(keys(local.group_configs)) : trimspace("GroupConfig-${k}")
   ])
+}
+
+# ──────────────────────────────────────────────────────────────
+# CHECKS
+# ──────────────────────────────────────────────────────────────
+
+check "no_duplicate_devices" {
+  assert {
+    condition = length(local.duplicate_device_groups) == 0
+    error_message = "Duplicate devices found: ${
+      join(", ", [
+        for k, v in local.duplicate_device_groups :
+        "${k} => [${join(", ", v)}]"
+      ])
+    }."
+  }
+}
+
+check "valid_schema" {
+  assert {
+    condition     = length(local.invalid_schema_configs) == 0
+    error_message = "Invalid JSON schema in configs: ${join(", ", local.invalid_schema_configs)}."
+  }
+}
+
+check "no_empty_device_lists" {
+  assert {
+    condition     = length(local.empty_device_configs) == 0
+    error_message = "Configs with empty device arrays: ${join(", ", local.empty_device_configs)}."
+  }
+}
+
+check "unique_group_ids" {
+  assert {
+    condition = length(local.duplicate_group_ids) == 0
+    error_message = "Duplicate groupIds detected: ${
+      join(", ", [
+        for gid, groups in local.duplicate_group_id_map :
+        "${gid} => [${join(", ", groups)}]"
+      ])
+    }."
+  }
 }
 
 resource "azurerm_automation_variable_string" "group_config" {
@@ -253,10 +373,10 @@ resource "azurerm_automation_job_schedule" "runbook_schedule_group_sync" {
 
   # Parameter names must be lowercase — Azure SDK limitation.
   parameters = {
-    managedidentityclientid  = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
-    automationvariablenames  = local.automation_variable_names
-    defaultremovestale       = "true"
-    whatif                   = "false"
+    managedidentityclientid = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
+    automationvariablenames = local.automation_variable_names
+    defaultremovestale      = "true"
+    whatif                  = "false"
   }
 }
 
