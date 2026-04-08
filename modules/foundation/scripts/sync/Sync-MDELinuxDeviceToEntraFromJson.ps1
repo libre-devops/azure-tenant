@@ -196,6 +196,7 @@ function Sanitize-InputString
 {
     param (
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string] $Value
     )
 
@@ -705,7 +706,7 @@ function Write-SyncSummary
 #  Everything runs inside a single top-level try/catch.
 #  Nothing executes at script scope outside function definitions — that pattern
 #  causes unhandled exceptions before any logging is active, producing the
-#  "job failed, no output" symptom seen previously.
+#  "job failed, no output".
 # ============================================================
 
 try

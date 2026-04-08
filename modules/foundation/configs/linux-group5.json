@@ -2,5 +2,7 @@
   "groupId": "1e651dab-48c9-46e2-966f-ff308ec51f20",
   "name": "linux-group5",
   "removeStale": true,
-  "devices": []
+  "devices": [
+    "vagrant-vm-rhel9-202604081738-5"
+  ]
 }

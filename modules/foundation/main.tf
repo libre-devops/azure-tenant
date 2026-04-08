@@ -245,7 +245,7 @@ resource "azurerm_automation_variable_string" "group_config" {
 }
 
 # ---------------------------------------------------------------------------
-#  DEBUG RUNTIME + RUNBOOK  (unchanged)
+#  DEBUG RUNTIME + RUNBOOK
 # ---------------------------------------------------------------------------
 
 resource "azurerm_automation_runtime_environment" "ps72_debug" {
@@ -382,7 +382,7 @@ resource "azurerm_automation_job_schedule" "runbook_schedule_group_sync" {
 }
 
 # ---------------------------------------------------------------------------
-#  ALERTING  (unchanged — still fires on failed jobs from the same runbook name)
+#  ALERTING
 # ---------------------------------------------------------------------------
 
 resource "azurerm_monitor_action_group" "mde_sync_alerts" {
