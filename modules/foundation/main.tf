@@ -54,6 +54,7 @@ data "azuread_service_principal" "graph" {
   client_id = "00000003-0000-0000-c000-000000000000" # MSGraph built-in SPN
 }
 
+# There can be a consistency error with this, it tries to run the data before making the UID, causing a "not found error".  Can probably handle that better, but re-run 2nd time fixes it for now
 data "azuread_service_principal" "mi" {
   depends_on = [module.automation_account]
 
