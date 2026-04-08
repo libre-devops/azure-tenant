@@ -1,157 +1,205 @@
 param (
     [Parameter(Mandatory)]
-    [string] $ManagedIdentityClientId
+    [string] $ManagedIdentityClientId,
+
+    [Parameter(Mandatory)]
+    $AutomationVariableNames   # intentionally untyped — avoids [string[]] binding issues
 )
 
 $ErrorActionPreference = 'Stop'
 $VerbosePreference     = 'SilentlyContinue'
 $ProgressPreference    = 'SilentlyContinue'
 
+# ── Canary lines ──────────────────────────────────────────────────────────────
+# Write-Output at script scope (not inside any function) is safe — nothing is
+# capturing these as a return value, so they go cleanly to the Output stream.
+# If these lines do not appear, the failure is at parameter binding / runtime
+# level and no code in this script is running. Check the Exception tab.
+Write-Output "$(Get-Date -Format 'HH:mm:ss') [CANARY] Script body reached — parameters bound OK."
+Write-Output "$(Get-Date -Format 'HH:mm:ss') [CANARY] ManagedIdentityClientId : $ManagedIdentityClientId"
+Write-Output "$(Get-Date -Format 'HH:mm:ss') [CANARY] AutomationVariableNames type : $($AutomationVariableNames.GetType().FullName)"
+Write-Output "$(Get-Date -Format 'HH:mm:ss') [CANARY] AutomationVariableNames value: $AutomationVariableNames"
+
 # ============================================================
-# LOGGING
+#  LOGGING
+#
+#  Write-Host  → Information stream — does NOT enter the pipeline.        ✅
+#               Safe to call inside functions that return values.
+#               Visible in the portal Output tab and All Logs tab.
+#
+#  Write-Output → Output stream — ENTERS the pipeline.                    ❌
+#               Calling this inside a returning function corrupts the
+#               return value. Used only for canary lines above (script
+#               scope, nothing capturing the output).
+#
+#  Write-Warning → Warning stream — also pipeline-safe, shows in Warnings tab.
 # ============================================================
 
-function Write-Log {
+function WriteLog {
     param (
-        [string]$Message,
-        [ValidateSet("INFO","DEBUG","WARN","ERROR")]
-        [string]$Level = "INFO"
+        [string] $Message,
+        [ValidateSet('INFO', 'DEBUG', 'WARN', 'ERROR')]
+        [string] $Level = 'INFO'
     )
 
-    $ts = Get-Date -Format "HH:mm:ss"
+    $ts = Get-Date -Format 'HH:mm:ss'
 
     switch ($Level) {
-        # Write-Host writes directly to the console and does NOT contribute to the
-        # PowerShell output stream. Using Write-Output here causes any function that
-        # calls Write-Log to return log lines concatenated with its actual return value,
-        # corrupting tokens, IDs, and anything else the function is meant to return.
-        "INFO"  { Write-Host    "$ts [INFO]  $Message" -ForegroundColor Green }
-        "DEBUG" { Write-Host    "$ts [DEBUG] $Message" -ForegroundColor Cyan }
-        "WARN"  { Write-Warning "$ts [WARN]  $Message" }
-        "ERROR" { Write-Host    "$ts [ERROR] $Message" -ForegroundColor Red }
+        'INFO'  { Write-Host    "$ts [INFO]  $Message" -ForegroundColor Green  }
+        'DEBUG' { Write-Host    "$ts [DEBUG] $Message" -ForegroundColor Cyan   }
+        'WARN'  { Write-Warning "$ts [WARN]  $Message"                         }
+        'ERROR' { Write-Host    "$ts [ERROR] $Message" -ForegroundColor Red    }
     }
 }
 
 # ============================================================
-# AUTH (USER-ASSIGNED MI)
+#  NORMALISE INPUT
 # ============================================================
 
-function Initialize-ManagedIdentityAuth {
-    try {
-        Write-Log "Authenticating using User Assigned Managed Identity..." "INFO"
-        Write-Log "ClientId: $ManagedIdentityClientId" "DEBUG"
+function NormalizeVariableNames {
+    param ($Names)
 
-        Disable-AzContextAutosave -Scope Process -ErrorAction SilentlyContinue | Out-Null
+    # Write-Host is safe here — it does not corrupt the function's return value.
+    WriteLog "Raw input type : $($Names.GetType().FullName)" 'DEBUG'
+    WriteLog "Raw input value: $Names" 'DEBUG'
 
-        Connect-AzAccount `
-            -Identity `
-            -AccountId $ManagedIdentityClientId `
-            -ErrorAction Stop | Out-Null
-
-        Write-Log "Managed Identity authentication successful." "INFO"
+    # Azure Automation job schedules pass all parameters as strings.
+    # A [string[]] parameter arrives as either:
+    #   (a) a plain [string] containing the comma-joined list, or
+    #   (b) a single-element array whose only element is that comma-joined string.
+    if ($Names -is [string]) {
+        WriteLog 'Detected plain STRING input — splitting by comma.' 'DEBUG'
+        $Names = $Names.Split(',')
     }
-    catch {
-        Write-Log "Managed Identity authentication FAILED: $($_.Exception.Message)" "ERROR"
-        throw
+    elseif ($Names.Count -eq 1 -and $Names[0] -match ',') {
+        WriteLog 'Detected single-element ARRAY with commas — splitting.' 'DEBUG'
+        $Names = $Names[0].Split(',')
     }
-}
 
-function Get-AccessToken {
-    param (
-        [Parameter(Mandatory)]
-        [string]$Resource
+    $Names = @(
+    $Names |
+            ForEach-Object { $_.Trim() } |
+            Where-Object   { $_ -ne '' } |
+            Sort-Object    -Unique
     )
 
-    try {
-        Write-Log "Requesting token for: $Resource" "INFO"
+    WriteLog "Normalised $($Names.Count) name(s): $($Names -join ', ')" 'DEBUG'
 
-        $tokenResponse = Get-AzAccessToken `
-            -ResourceUrl $Resource `
-            -ErrorAction Stop
-
-        if (-not $tokenResponse.Token) {
-            throw "Token extraction failed — response contained no token."
-        }
-
-        # Cast explicitly to [string] to guarantee a clean scalar return value.
-        # At Az 11.2.0 the token is already a plain string, but the explicit cast
-        # prevents edge cases where PowerShell wraps it in an Object[].
-        $token = [string]$tokenResponse.Token
-
-        Write-Log "Token acquired for $Resource (type: $($tokenResponse.Token.GetType().Name), length: $($token.Length))" "DEBUG"
-        return $token
-    }
-    catch {
-        Write-Log "Failed to acquire token for $Resource : $($_.Exception.Message)" "ERROR"
-        throw
-    }
+    # return is the ONLY thing that goes to the pipeline from this function.
+    return $Names
 }
 
 # ============================================================
-# MAIN
+#  AUTH
+# ============================================================
+
+function InitAuth {
+    WriteLog 'Authenticating via Managed Identity...' 'INFO'
+
+    Disable-AzContextAutosave -Scope Process -ErrorAction SilentlyContinue | Out-Null
+
+    Connect-AzAccount `
+        -Identity `
+        -AccountId $ManagedIdentityClientId `
+        -ErrorAction Stop | Out-Null
+
+    WriteLog 'Auth success.' 'INFO'
+}
+
+function GetToken {
+    param ([string] $Resource)
+
+    # [string] cast ensures a clean scalar even if Get-AzAccessToken wraps the
+    # value in an array or object on some Az module versions.
+    $token = [string](Get-AzAccessToken -ResourceUrl $Resource -ErrorAction Stop).Token
+
+    # Write-Host here is safe — it does not enter the pipeline and will not
+    # be concatenated onto $token at the call site.
+    WriteLog "Token acquired for '$Resource' (length: $($token.Length))." 'DEBUG'
+
+    return $token
+}
+
+# ============================================================
+#  MAIN
 # ============================================================
 
 try {
-    Write-Log "===== RUNBOOK START =====" "INFO"
+    WriteLog '===== DEBUG RUN START =====' 'INFO'
 
-    # --- AUTH ---
-    Initialize-ManagedIdentityAuth
+    # ── Auth ─────────────────────────────────────────────────────────────────
+    InitAuth
+    $graphToken = GetToken 'https://graph.microsoft.com'
 
-    # --- TOKENS ---
-    $graphToken = Get-AccessToken "https://graph.microsoft.com"
-    $mdeToken   = Get-AccessToken "https://api.securitycenter.microsoft.com"
+    # ── Normalise parameter ───────────────────────────────────────────────────
+    # NormalizeVariableNames uses Write-Host internally — the return value is
+    # only the clean string array, not a mix of log lines and names.
+    $AutomationVariableNames = NormalizeVariableNames -Names $AutomationVariableNames
 
-    # ========================================================
-    # GRAPH TEST
-    # ========================================================
+    # ── Variable load + JSON parse + Graph probe ──────────────────────────────
+    foreach ($varName in $AutomationVariableNames) {
 
-    try {
-        Write-Log "Calling Microsoft Graph..." "INFO"
+        WriteLog "--- Testing variable: '$varName' ---" 'INFO'
 
-        $graph = Invoke-RestMethod `
-            -Uri        "https://graph.microsoft.com/v1.0/devices" `
-            -Headers    @{ Authorization = "Bearer $graphToken" } `
-            -TimeoutSec 15 `
-            -Verbose:$false
+        # Retrieve
+        try {
+            $raw = Get-AutomationVariable -Name $varName
+            WriteLog "Retrieved '$varName' OK (length: $($raw.Length))." 'INFO'
+        }
+        catch {
+            WriteLog "FAILED to retrieve '$varName': $($_.Exception.Message)" 'ERROR'
+            continue
+        }
 
-        $graphCount = if ($graph.value) { $graph.value.Count } else { 0 }
-        Write-Log "Graph SUCCESS. Devices returned: $graphCount" "INFO"
+        # Parse
+        try {
+            $cfg = $raw | ConvertFrom-Json
+            WriteLog 'JSON parsed OK.' 'INFO'
+        }
+        catch {
+            WriteLog "JSON PARSE FAILED: $($_.Exception.Message)" 'ERROR'
+            continue
+        }
+
+        # Validate shape
+        WriteLog "  groupId     : $($cfg.groupId)"        'DEBUG'
+        WriteLog "  name        : $($cfg.name)"            'DEBUG'
+        WriteLog "  removeStale : $($cfg.removeStale)"     'DEBUG'
+        WriteLog "  device count: $($cfg.devices.Count)"   'DEBUG'
+
+        if (-not $cfg.groupId) { WriteLog "  !! Missing 'groupId'!"  'ERROR' }
+        if (-not $cfg.devices -or $cfg.devices.Count -eq 0) {
+            WriteLog "  !! 'devices' is missing or empty — update this JSON config." 'WARN'
+        }
+
+        # Graph probe — look up first device in the config
+        if ($cfg.devices.Count -gt 0) {
+            $testDevice = $cfg.devices[0].Trim()
+            $shortName  = $testDevice.Split('.')[0]
+            WriteLog "  Graph probe for first device: '$testDevice' (short: '$shortName')" 'INFO'
+
+            try {
+                $res = Invoke-RestMethod `
+                    -Uri     "https://graph.microsoft.com/v1.0/devices?`$filter=startswith(displayName,'$shortName')&`$select=id,displayName&`$top=5" `
+                    -Headers @{ Authorization = "Bearer $graphToken" }
+
+                WriteLog "  Graph returned $($res.value.Count) result(s)." 'INFO'
+
+                foreach ($r in $res.value) {
+                    WriteLog "    → '$($r.displayName)'  id: $($r.id)" 'DEBUG'
+                }
+            }
+            catch {
+                WriteLog "  Graph probe FAILED: $($_.Exception.Message)" 'ERROR'
+            }
+        }
     }
-    catch {
-        Write-Log "Graph FAILED: $($_.Exception.Message)" "ERROR"
-        throw
-    }
 
-    # ========================================================
-    # MDE TEST
-    # ========================================================
-
-    try {
-        Write-Log "Calling Defender for Endpoint..." "INFO"
-
-        $mde = Invoke-RestMethod `
-            -Uri        "https://api.securitycenter.microsoft.com/api/machines" `
-            -Headers    @{ Authorization = "Bearer $mdeToken" } `
-            -TimeoutSec 15 `
-            -Verbose:$false
-
-        $mdeCount = if ($mde.value) { $mde.value.Count } else { 0 }
-        Write-Log "MDE SUCCESS. Machines returned: $mdeCount" "INFO"
-    }
-    catch {
-        Write-Log "MDE FAILED: $($_.Exception.Message)" "ERROR"
-        throw
-    }
-
-    # ========================================================
-    # FINAL VALIDATION OUTPUT
-    # ========================================================
-
-    Write-Log "===== RUNBOOK COMPLETED SUCCESSFULLY =====" "INFO"
-    Write-Output "RESULT: GraphDevices=$graphCount; MDEDevices=$mdeCount"
+    WriteLog '===== DEBUG RUN COMPLETE =====' 'INFO'
 }
 catch {
-    Write-Log "===== RUNBOOK FAILED =====" "ERROR"
-    Write-Log $_.Exception.Message "ERROR"
+    # Write-Host here too — keeps the error message out of the pipeline.
+    Write-Host "$(Get-Date -Format 'HH:mm:ss') [FATAL] $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host $_.ScriptStackTrace -ForegroundColor Red
     throw
 }

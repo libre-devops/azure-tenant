@@ -252,8 +252,6 @@ resource "azurerm_automation_job_schedule" "runbook_schedule_group_sync" {
   schedule_name = azurerm_automation_schedule.every_60_min.name
 
   # Parameter names must be lowercase — Azure SDK limitation.
-  # [string[]] parameters are passed as a comma-separated string; Azure Automation
-  # splits on commas when binding to the array parameter in the runbook.
   parameters = {
     managedidentityclientid  = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
     automationvariablenames  = local.automation_variable_names
