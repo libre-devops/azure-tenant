@@ -206,7 +206,7 @@ resource "azurerm_automation_runbook" "runbook_group_sync" {
   description              = "Sync explicitly-configured devices into Entra ID security groups"
 
   # Runbook reads group membership from Automation Variables — no MDE dependency.
-  content = file("${path.module}/scripts/sync/Sync-EntraGroupsFromConfig.ps1")
+  content = file("${path.module}/scripts/sync/Sync-MDELinuxDeviceToEntraFromJson.ps1")
 
   # Variables must exist before the runbook runs — enforce ordering.
   depends_on = [azurerm_automation_variable_string.group_config]
