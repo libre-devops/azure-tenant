@@ -32,11 +32,21 @@
 
     LOGGING
     ───────
-    Write-Verbose : INFO/DEBUG — visible in All Logs tab when log_verbose = true.
-                    Safe inside functions that return values (does not enter pipeline).
-    Write-Warning : WARN — visible in Warnings tab and All Logs.
-    Write-Host    : ERROR lines and summary report only. Information stream, safe.
-    Write-Output  : NEVER used — enters the pipeline and corrupts function return values.
+    Log levels map onto streams chosen so nothing ever lands on the SUCCESS stream
+    inside a value-returning function (that would corrupt the return value — the
+    classic way the Graph token gets mangled into "Bearer <logline> <token>").
+
+    DEBUG   → Write-Verbose : low-level detail. All Logs tab only, when verbose on.
+    INFO    → Write-Verbose : operational steps. All Logs tab only, when verbose on.
+    STATUS  → Write-Host    : key milestones (start, per-group result, totals).
+                              ALWAYS visible, even with verbose off — the baseline
+                              audit trail. Information stream (6), safe in functions.
+    WARN    → Write-Warning : Warnings tab + All Logs. Always visible.
+    ERROR   → Write-Host    : failures. Always visible. NON-terminating on purpose —
+                              Write-Error would throw under $ErrorActionPreference=Stop
+                              and defeat the count-and-continue design.
+    Write-Output            : NEVER used — enters the success pipeline and corrupts
+                              function return values.
 
 .PARAMETER ManagedIdentityClientId
     Client ID of the User-Assigned Managed Identity attached to this Automation Account.
@@ -52,7 +62,15 @@
     Azure Automation. Change the default here if needed.
 
 .PARAMETER MaxRetries / RetryDelaySeconds
-    Retry configuration for transient API failures.
+    Retry configuration for transient API failures. A 401 inside the retry loop
+    force-refreshes the Graph token before retrying (see TOKEN HANDLING in .NOTES).
+
+.PARAMETER StaleRemovalMinCount / StaleRemovalMaxPercent
+    Blast-radius guard for stale removal. A run that would remove MORE than
+    StaleRemovalMinCount members AND MORE than StaleRemovalMaxPercent of a group's
+    current membership aborts removals for that group and fails the job. BOTH must
+    be exceeded. Defaults: 5 devices and 0.20 (20%). Stage genuine bulk removals
+    across multiple runs so each stays under the limit. WhatIf bypasses the guard.
 
 .PARAMETER WhatIf
     If $true, no writes to any group. Do NOT pass from job schedule (same [bool] reason).
@@ -82,6 +100,42 @@
     │ Microsoft Graph         │ Device.Read.All              │ Fetch all Entra device objects   │
     │ (graph.microsoft.com)   │ GroupMember.ReadWrite.All    │ Read, add and remove members     │
     └─────────────────────────┴──────────────────────────────┴──────────────────────────────────┘
+
+    Least-privilege alternative: keep the two READS as app permissions
+    (Device.Read.All + GroupMember.Read.All) and grant member WRITES via a custom
+    Entra directory role with action
+    'microsoft.directory/groups.security.assignedMembership/members/update',
+    scoped to the target groups. Note that action only covers ASSIGNED-membership
+    security groups — not dynamic or M365/mail-enabled groups.
+
+    ─────────────────────────────────────────────────────────────────────────────
+    LONG-RUNNING RELIABILITY  (this runbook is expected to run unattended for years)
+    ─────────────────────────────────────────────────────────────────────────────
+
+    MODULE PINNING
+        The Automation Account pins its Az module versions (managed in the
+        environment / Terraform). This matters: module auto-update is the #1 silent
+        breaker of long-lived runbooks. Upgrade deliberately, then re-test. The
+        token extraction below is defence-in-depth for the day a pin is bumped.
+
+    TOKEN HANDLING
+        Get-GraphToken caches the Graph token at script scope and auto-refreshes
+        when it is missing or within 5 minutes of expiry. It is called before each
+        group, and Invoke-WithRetry force-refreshes on a 401 — so a job that runs
+        longer than the ~60–90 min token lifetime (large tenants / many groups)
+        does not fail on an expired token. Token extraction handles BOTH a plaintext
+        string and a SecureString (.Token became SecureString-by-default in
+        Az.Accounts 5.x) so a module bump can't silently produce a bad token.
+
+    BLAST-RADIUS GUARD
+        See StaleRemovalMinCount / StaleRemovalMaxPercent. Protects against a
+        truncated/corrupt config (or a transient empty device index) gutting a group
+        in one run. Genuine bulk removals are staged across runs.
+
+    DUPLICATE DEVICES
+        Entra accumulates duplicate device objects as machines re-enroll. The index
+        is first-wins on exact displayName and WARNs on collisions so a stale target
+        is visible. Clean up duplicates in Entra to keep resolution deterministic.
 #>
 
 [CmdletBinding()]
@@ -99,7 +153,16 @@ param (
     [bool] $WhatIf = $false,
 
     [int] $MaxRetries = 6,
-    [int] $RetryDelaySeconds = 20
+    [int] $RetryDelaySeconds = 20,
+
+# Blast-radius guard for stale removal. A single run that would remove MORE than
+# StaleRemovalMinCount members AND MORE than StaleRemovalMaxPercent of a group's
+# current membership is aborted for that group and fails the job. BOTH thresholds
+# must be exceeded — the percentage stops large-group wipeouts, the absolute floor
+# stops false positives on tiny groups (20% of 1 rounds to 0). Stage genuine bulk
+# removals across multiple runs.
+    [int]    $StaleRemovalMinCount   = 5,
+    [double] $StaleRemovalMaxPercent = 0.20
 )
 
 Set-StrictMode -Version Latest
@@ -108,17 +171,26 @@ $ErrorActionPreference = 'Stop'
 $script:SyncErrorCount = 0
 $script:PendingCount = 0
 
+# Graph token cache. Populated by Get-GraphToken and read directly by every Graph
+# call (via $script:GraphToken) so a force-refresh on 401 is picked up on retry.
+$script:GraphResource       = 'https://graph.microsoft.com'
+$script:GraphToken          = $null
+$script:GraphTokenExpiresOn = [datetimeoffset]::MinValue
+
 # ============================================================
 #  LOGGER
-#  Write-Verbose for INFO/DEBUG — safe inside returning functions.
-#  Write-Host for ERROR/summary — Information stream, also safe.
-#  Write-Output is NEVER used — it corrupts function return values.
+#  DEBUG/INFO → Write-Verbose : All Logs only (needs verbose enabled).
+#  STATUS     → Write-Host    : milestones, ALWAYS visible. Information stream.
+#  WARN       → Write-Warning : Warnings tab + All Logs.
+#  ERROR      → Write-Host    : failures, ALWAYS visible, non-terminating.
+#  None touch the SUCCESS stream, so they are safe inside returning functions.
+#  Write-Output is NEVER used — it corrupts function return values (and tokens).
 # ============================================================
 
 function Log-Message
 {
     param (
-        [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR')]
+        [ValidateSet('DEBUG', 'INFO', 'STATUS', 'WARN', 'ERROR')]
         [string] $Level,
         [string] $Message,
         [string] $InvocationName
@@ -129,18 +201,21 @@ function Log-Message
 
     switch ($Level)
     {
-        'DEBUG' {
+        'DEBUG'  {
             Write-Verbose "$prefix $Message"
         }                          # All Logs only — low-level detail
-        'INFO'  {
-            Write-Verbose   "$prefix $Message"
-        }  # Always visible — operational steps
-        'WARN'  {
+        'INFO'   {
+            Write-Verbose "$prefix $Message"
+        }                          # All Logs only — operational steps (verbose)
+        'STATUS' {
+            Write-Host "$prefix $Message" -ForegroundColor Cyan
+        }   # Always visible — milestone/audit baseline
+        'WARN'   {
             Write-Warning "$prefix $Message"
         }                          # Warnings tab + All Logs
-        'ERROR' {
-            Write-Error   "$prefix $Message"
-        }  # Always visible — failures
+        'ERROR'  {
+            Write-Host "$prefix $Message" -ForegroundColor Red
+        }      # Always visible — non-terminating (Write-Error throws under -EAP Stop)
     }
 }
 
@@ -224,6 +299,46 @@ function Sanitize-InputString
     return $Value
 }
 
+function Get-GraphError
+{
+    <#
+    .SYNOPSIS
+        Extracts a useful, human-readable message from a failed Graph call.
+    .DESCRIPTION
+        In PowerShell 7, Invoke-RestMethod puts only the generic ".NET status
+        code" text in $_.Exception.Message. The actual Graph error body — the
+        bit you care about (error.code + error.message, e.g.
+        'Authorization_RequestDenied') — lives in $_.ErrorDetails.Message.
+        This surfaces the status code plus that body, falling back gracefully
+        for non-HTTP errors.
+    #>
+    param ($ErrorRecord)
+
+    $resp = $null
+    if ($ErrorRecord.Exception.PSObject.Properties['Response'])
+    {
+        $resp = $ErrorRecord.Exception.Response
+    }
+    $status = if ($resp) { [int]$resp.StatusCode } else { '?' }
+
+    $detail = $ErrorRecord.ErrorDetails.Message
+    if ($detail)
+    {
+        try
+        {
+            $j = $detail | ConvertFrom-Json
+            if ($j.error)
+            {
+                return "HTTP $status | $( $j.error.code ): $( $j.error.message )"
+            }
+        }
+        catch { }   # body wasn't JSON — fall through to raw
+        return "HTTP $status | $detail"
+    }
+
+    return "HTTP $status | $( $ErrorRecord.Exception.Message )"
+}
+
 # ============================================================
 #  AUTH
 # ============================================================
@@ -260,40 +375,81 @@ function Initialize-ManagedIdentityAuth
     }
 }
 
-function Get-AccessToken
+function Get-GraphToken
 {
-    param (
-        [Parameter(Mandatory)]
-        [string] $Resource
-    )
+    <#
+    .SYNOPSIS
+        Returns a valid Microsoft Graph token, refreshing transparently.
+    .DESCRIPTION
+        Caches the token at script scope and re-acquires it when missing, forced,
+        or within 5 minutes of expiry. Called before each group, and force-refreshed
+        on a 401 inside Invoke-WithRetry, so a run that outlives the ~60–90 min token
+        lifetime (large tenants / many groups) does not fail on an expired token.
+        Handles both plaintext and SecureString .Token (SecureString became the
+        Az.Accounts 5.x default) so a pinned-module bump can't silently break auth.
+    #>
+    param ([switch] $Force)
+
+    $stillValid = $script:GraphToken -and
+                  ([datetimeoffset]::UtcNow -lt $script:GraphTokenExpiresOn.AddMinutes(-5))
+
+    if (-not $Force -and $stillValid)
+    {
+        return $script:GraphToken
+    }
 
     try
     {
         Log-Message -Level INFO `
-                    -Message "Requesting token for: $Resource" `
+                    -Message "$( if ($Force) { 'Force-refreshing' } else { 'Acquiring' } ) Graph token..." `
                     -InvocationName $MyInvocation.MyCommand.Name
 
-        $tokenResponse = Get-AzAccessToken -ResourceUrl $Resource -ErrorAction Stop
+        $tokenResponse = Get-AzAccessToken -ResourceUrl $script:GraphResource -ErrorAction Stop
 
         if (-not $tokenResponse.Token)
         {
             throw 'Token extraction failed — response contained no token.'
         }
 
-        # [string] cast guards against PS wrapping the token in Object[].
-        # Write-Verbose (via Log-Message) is safe here — does not enter pipeline.
-        $token = [string]$tokenResponse.Token
+        # .Token may be a SecureString OR a plaintext string depending on the pinned
+        # Az.Accounts version (SecureString became the default in 5.x). Handle both so
+        # a module bump can't turn the token into the literal 'System.Security.SecureString'.
+        # [string] cast also guards against PS wrapping a plain token in Object[].
+        $rawToken = $tokenResponse.Token
+        $token = if ($rawToken -is [System.Security.SecureString])
+        {
+            [System.Net.NetworkCredential]::new('', $rawToken).Password
+        }
+        else
+        {
+            [string]$rawToken
+        }
 
-        Log-Message -Level DEBUG `
-                    -Message "Token acquired (length: $( $token.Length ))" `
+        if ([string]::IsNullOrWhiteSpace($token) -or $token -eq 'System.Security.SecureString')
+        {
+            throw 'Token extraction produced an empty or unconverted value — check the Az.Accounts module version.'
+        }
+
+        $script:GraphToken = $token
+        $script:GraphTokenExpiresOn = if ($tokenResponse.ExpiresOn)
+        {
+            [datetimeoffset]$tokenResponse.ExpiresOn
+        }
+        else
+        {
+            [datetimeoffset]::UtcNow.AddMinutes(50)   # conservative fallback
+        }
+
+        Log-Message -Level INFO `
+                    -Message "Graph token ready (length: $( $token.Length ), expires: $( $script:GraphTokenExpiresOn.ToString('u') ))" `
                     -InvocationName $MyInvocation.MyCommand.Name
 
-        return $token
+        return $script:GraphToken
     }
     catch
     {
         Log-Message -Level ERROR `
-                    -Message "Failed to acquire token for '$Resource': $( $_.Exception.Message )" `
+                    -Message "Failed to acquire Graph token: $( $_.Exception.Message )" `
                     -InvocationName $MyInvocation.MyCommand.Name
         throw
     }
@@ -318,16 +474,34 @@ function Invoke-WithRetry
         }
         catch
         {
-            $msg = $_.Exception.Message
+            $msg = Get-GraphError -ErrorRecord $_
             $retryAfter = $null
 
-            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response)
+            $resp = if ($_.Exception.PSObject.Properties['Response']) { $_.Exception.Response } else { $null }
+            $statusCode = if ($resp) { [int]$resp.StatusCode } else { 0 }
+
+            # 401 mid-run = the token expired during a long job. Force-refresh it;
+            # the Graph calls read $script:GraphToken, so the next attempt picks up
+            # the new token. Refresh failures are swallowed — the retry will surface
+            # the real error if auth is genuinely broken.
+            if ($statusCode -eq 401)
             {
-                $retryAfter = $_.Exception.Response.Headers?['Retry-After']
+                Log-Message -Level WARN -Message "401 on '$OperationName' — refreshing Graph token before retry." -InvocationName $MyInvocation.MyCommand.Name
+                try { Get-GraphToken -Force | Out-Null } catch { }
             }
-            if ($retryAfter -is [array])
+
+            # HttpResponseHeaders has NO string indexer. The old
+            # $...Headers?['Retry-After'] threw "Unable to index into an object
+            # of type System.Net.Http.Headers.HttpResponseHeaders" from inside
+            # this catch — which masked the real Graph error AND broke 429
+            # backoff. TryGetValues is the supported access path.
+            if ($resp)
             {
-                $retryAfter = $retryAfter[0]
+                $vals = $null
+                if ($resp.Headers.TryGetValues('Retry-After', [ref]$vals))
+                {
+                    $retryAfter = @($vals)[0]
+                }
             }
 
             $delay = if ($retryAfter -and ($retryAfter -as [int]))
@@ -361,15 +535,14 @@ function Invoke-WithRetry
 
 function Build-DeviceIndex
 {
-    param ([string] $GraphToken)
-
+    # Reads the token from $script:GraphToken so a mid-run refresh is picked up.
     $allDevices = [System.Collections.Generic.List[pscustomobject]]::new()
     $uri = "https://graph.microsoft.com/v1.0/devices?`$select=id,displayName&`$top=999"
 
     do
     {
         $res = Invoke-WithRetry -OperationName 'Fetch all Entra devices' -ScriptBlock {
-            Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $GraphToken" }
+            Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $script:GraphToken" }
         }
 
         if ($res.value)
@@ -403,9 +576,19 @@ function Build-DeviceIndex
         $full  = $d.displayName.ToLower()
         $short = $full.Split('.')[0]
 
+        # Exact displayName collision = a true duplicate Entra object (common
+        # when a device re-enrolls and the old record lingers). First wins, but
+        # WARN so a wrong/stale target is visible rather than silent. Short-name
+        # collisions are expected (server01.a vs server01.b) and stay quiet.
         if (-not $deviceIndex.ContainsKey($full))
         {
             $deviceIndex[$full] = $d.id
+        }
+        else
+        {
+            Log-Message -Level WARN `
+                -Message "Duplicate Entra displayName '$full' — keeping $( $deviceIndex[$full] ), ignoring $( $d.id ). Likely a stale/re-enrolled object; resolution may target the wrong device. Clean up the duplicate in Entra." `
+                -InvocationName 'Build-DeviceIndex'
         }
 
         if (-not $deviceIndex.ContainsKey($short))
@@ -474,7 +657,7 @@ function Resolve-Device
 
 function Add-DeviceToGroup
 {
-    param ($GroupId, $DeviceId, $Token)
+    param ($GroupId, $DeviceId)
 
     if ($WhatIf)
     {
@@ -484,18 +667,18 @@ function Add-DeviceToGroup
 
     try
     {
-        Invoke-WithRetry -OperationName "Add device ($DeviceId)" -ScriptBlock {
+        $null = Invoke-WithRetry -OperationName "Add device ($DeviceId)" -ScriptBlock {
             Invoke-RestMethod `
                 -Method  POST `
                 -Uri     "https://graph.microsoft.com/v1.0/groups/$GroupId/members/`$ref" `
-                -Headers @{ Authorization = "Bearer $Token"; 'Content-Type' = 'application/json' } `
+                -Headers @{ Authorization = "Bearer $script:GraphToken"; 'Content-Type' = 'application/json' } `
                 -Body    (@{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$DeviceId" } | ConvertTo-Json)
         }
         Log-Message -Level INFO -Message "Successfully added $DeviceId to group $GroupId." -InvocationName $MyInvocation.MyCommand.Name
     }
     catch
     {
-        if ($_.Exception.Message -match 'already exist')
+        if ((Get-GraphError -ErrorRecord $_) -match 'already exist')
         {
             Log-Message -Level DEBUG -Message "Device $DeviceId already a member (race condition — safe to ignore)." -InvocationName $MyInvocation.MyCommand.Name
             return
@@ -506,7 +689,7 @@ function Add-DeviceToGroup
 
 function Remove-DeviceFromGroup
 {
-    param ($GroupId, $DeviceId, $Token)
+    param ($GroupId, $DeviceId)
 
     if ($WhatIf)
     {
@@ -516,17 +699,17 @@ function Remove-DeviceFromGroup
 
     try
     {
-        Invoke-WithRetry -OperationName "Remove device ($DeviceId)" -ScriptBlock {
+        $null = Invoke-WithRetry -OperationName "Remove device ($DeviceId)" -ScriptBlock {
             Invoke-RestMethod `
                 -Method  DELETE `
                 -Uri     "https://graph.microsoft.com/v1.0/groups/$GroupId/members/$DeviceId/`$ref" `
-                -Headers @{ Authorization = "Bearer $Token" }
+                -Headers @{ Authorization = "Bearer $script:GraphToken" }
         }
         Log-Message -Level INFO -Message "Successfully removed $DeviceId from group $GroupId." -InvocationName $MyInvocation.MyCommand.Name
     }
     catch
     {
-        if ($_.Exception.Message -match 'does not exist')
+        if ((Get-GraphError -ErrorRecord $_) -match 'does not exist')
         {
             Log-Message -Level DEBUG -Message "Device $DeviceId already removed (safe to ignore)." -InvocationName $MyInvocation.MyCommand.Name
             return
@@ -538,8 +721,7 @@ function Remove-DeviceFromGroup
 function Get-AllGroupMembers
 {
     param (
-        [Parameter(Mandatory)] [string] $GroupId,
-        [Parameter(Mandatory)] [string] $Token
+        [Parameter(Mandatory)] [string] $GroupId
     )
 
     $all = [System.Collections.Generic.List[pscustomobject]]::new()
@@ -548,7 +730,7 @@ function Get-AllGroupMembers
     do
     {
         $res = Invoke-WithRetry -OperationName "Get members ($GroupId)" -ScriptBlock {
-            Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $Token" }
+            Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $script:GraphToken" }
         }
 
         if ($res.value)
@@ -718,14 +900,14 @@ try
     $AutomationVariableNames = Sanitize-InputString -Value $AutomationVariableNames
     $AutomationVariableNames = NormalizeVariableNames -Names $AutomationVariableNames
 
-    Log-Message -Level INFO `
+    Log-Message -Level STATUS `
                 -Message "========== Sync started | Variables: '$( $AutomationVariableNames -join "', '" )' | DefaultRemoveStale: $DefaultRemoveStale | WhatIf: $WhatIf ==========" `
                 -InvocationName 'MAIN'
 
     # ── Auth ──────────────────────────────────────────────────────────────────
 
     Initialize-ManagedIdentityAuth
-    $graphToken = Get-AccessToken -Resource 'https://graph.microsoft.com'
+    Get-GraphToken | Out-Null   # prime the cache; calls read $script:GraphToken
 
     # ── Load and validate group configs ──────────────────────────────────────
 
@@ -811,13 +993,13 @@ try
         throw "No valid group configs could be loaded. Total parse errors: $script:SyncErrorCount"
     }
 
-    Log-Message -Level INFO `
+    Log-Message -Level STATUS `
                 -Message "Loaded $( $groupConfigs.Count ) group(s) with devices. $( $AutomationVariableNames.Count - $groupConfigs.Count ) skipped (empty or errored)." `
                 -InvocationName 'MAIN'
 
     # ── Build Entra device index (single Graph call) ──────────────────────────
 
-    $deviceIndex, $fuzzyList = Build-DeviceIndex -GraphToken $graphToken
+    $deviceIndex, $fuzzyList = Build-DeviceIndex
 
     # ── Process each group ────────────────────────────────────────────────────
 
@@ -829,7 +1011,10 @@ try
         $groupName = $groupCfg.Name
         $removeStale = $groupCfg.RemoveStale
 
-        Log-Message -Level INFO `
+        # Refresh the token if it is close to expiry — keeps long, many-group runs alive.
+        Get-GraphToken | Out-Null
+
+        Log-Message -Level STATUS `
                     -Message "--- Processing group '$groupName' ($groupId) | devices: $( $groupCfg.Devices.Count ) | removeStale: $removeStale ---" `
                     -InvocationName 'MAIN'
 
@@ -838,7 +1023,7 @@ try
         $pendingDevices = [System.Collections.Generic.List[string]]::new()
         $skippedDevices = [System.Collections.Generic.List[string]]::new()
 
-        $currentMembers = Get-AllGroupMembers -GroupId $groupId -Token $graphToken
+        $currentMembers = Get-AllGroupMembers -GroupId $groupId
         $currentIds = @($currentMembers | Select-Object -ExpandProperty Id)
 
         $resolvedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
@@ -869,14 +1054,14 @@ try
             {
                 try
                 {
-                    Add-DeviceToGroup -GroupId $groupId -DeviceId $device.Id -Token $graphToken
+                    Add-DeviceToGroup -GroupId $groupId -DeviceId $device.Id
                     $addedDevices.Add($device)
                     Log-Message -Level INFO -Message "Added '$( $device.DisplayName )' ($( $device.Id )) to '$groupName'." -InvocationName 'MAIN'
                 }
                 catch
                 {
                     $script:SyncErrorCount++
-                    Log-Message -Level ERROR -Message "Failed to add '$( $device.DisplayName )' ($( $device.Id )) to '$groupName': $( $_.Exception.Message )" -InvocationName 'MAIN'
+                    Log-Message -Level ERROR -Message "Failed to add '$( $device.DisplayName )' ($( $device.Id )) to '$groupName': $( Get-GraphError -ErrorRecord $_ )" -InvocationName 'MAIN'
                 }
             }
             else
@@ -887,28 +1072,47 @@ try
 
         if ($removeStale)
         {
-            foreach ($member in $currentMembers)
+            $staleMembers = @($currentMembers | Where-Object { $resolvedIds -notcontains $_.Id })
+            $staleCount   = $staleMembers.Count
+            $memberCount  = $currentMembers.Count
+            $stalePercent = if ($memberCount -gt 0) { $staleCount / $memberCount } else { 0 }
+
+            # ── Blast-radius guard ────────────────────────────────────────────
+            # A truncated/corrupt config (or a bad bulk edit) could otherwise gut
+            # a group in a single run. Trip only when BOTH thresholds are exceeded:
+            # the percentage stops large-group wipeouts, the absolute floor stops
+            # false positives on small groups. Genuine bulk removals must be staged
+            # across multiple runs to stay under the limit. WhatIf bypasses the
+            # guard since nothing is actually written.
+            if (-not $WhatIf -and $staleCount -gt $StaleRemovalMinCount -and $stalePercent -gt $StaleRemovalMaxPercent)
             {
-                if ($resolvedIds -notcontains $member.Id)
+                $script:SyncErrorCount++
+                Log-Message -Level ERROR `
+                    -Message ("BLAST-RADIUS GUARD: '$groupName' would remove $staleCount of $memberCount member(s) ({0:P1}) — exceeds limit (>{1} devices AND >{2:P0}). Skipping ALL removals for this group; stage the change across multiple runs. Run will fail." -f $stalePercent, $StaleRemovalMinCount, $StaleRemovalMaxPercent) `
+                    -InvocationName 'MAIN'
+            }
+            else
+            {
+                foreach ($member in $staleMembers)
                 {
                     try
                     {
-                        Remove-DeviceFromGroup -GroupId $groupId -DeviceId $member.Id -Token $graphToken
+                        Remove-DeviceFromGroup -GroupId $groupId -DeviceId $member.Id
                         $removedDevices.Add($member)
                         Log-Message -Level INFO -Message "Removed stale '$( $member.DisplayName )' ($( $member.Id )) from '$groupName'." -InvocationName 'MAIN'
                     }
                     catch
                     {
                         $script:SyncErrorCount++
-                        Log-Message -Level ERROR -Message "Failed to remove '$( $member.DisplayName )' ($( $member.Id )) from '$groupName': $( $_.Exception.Message )" -InvocationName 'MAIN'
+                        Log-Message -Level ERROR -Message "Failed to remove '$( $member.DisplayName )' ($( $member.Id )) from '$groupName': $( Get-GraphError -ErrorRecord $_ )" -InvocationName 'MAIN'
                     }
                 }
             }
         }
 
-        $finalMembers = Get-AllGroupMembers -GroupId $groupId -Token $graphToken
+        $finalMembers = Get-AllGroupMembers -GroupId $groupId
 
-        Log-Message -Level INFO `
+        Log-Message -Level STATUS `
                     -Message "Group '$groupName' complete | Added: $( $addedDevices.Count ) | Removed: $( $removedDevices.Count ) | Pending: $( $pendingDevices.Count ) | Skipped: $( $skippedDevices.Count )" `
                     -InvocationName 'MAIN'
 
@@ -927,7 +1131,7 @@ try
     $totalAdded = ($groupResults | ForEach-Object { $_.Added.Count }   | Measure-Object -Sum).Sum
     $totalRemoved = ($groupResults | ForEach-Object { $_.Removed.Count } | Measure-Object -Sum).Sum
 
-    Log-Message -Level INFO `
+    Log-Message -Level STATUS `
                 -Message "========== Sync complete | Groups: $( $groupResults.Count ) | Added: $totalAdded | Removed: $totalRemoved | Pending: $script:PendingCount | Errors: $script:SyncErrorCount ==========" `
                 -InvocationName 'MAIN'
 

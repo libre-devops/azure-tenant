@@ -373,11 +373,14 @@ resource "azurerm_automation_job_schedule" "runbook_schedule_group_sync" {
   schedule_name = azurerm_automation_schedule.every_60_min.name
 
   # Parameter names must be lowercase — Azure SDK limitation.
+  # Only pass string/string-array params. DefaultRemoveStale and WhatIf are
+  # intentionally OMITTED: Azure Automation binds schedule params as strings, and
+  # [bool]"false" evaluates to $true in PowerShell — so passing them risks silently
+  # flipping the runbook into WhatIf (no-op) mode. The in-script defaults
+  # ($DefaultRemoveStale = $true, $WhatIf = $false) already match the intent.
   parameters = {
     managedidentityclientid = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
     automationvariablenames = local.automation_variable_names
-    defaultremovestale      = "true"
-    whatif                  = "false"
   }
 }
 
