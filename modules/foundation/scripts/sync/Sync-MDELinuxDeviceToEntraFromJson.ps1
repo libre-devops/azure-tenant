@@ -448,7 +448,13 @@ function Get-GraphToken
         }
 
         $script:GraphToken = $token
-        $script:GraphTokenExpiresOn = if ($tokenResponse.ExpiresOn)
+
+        # Under Set-StrictMode -Version Latest, referencing a missing property
+        # THROWS rather than returning $null — so probe for existence via PSObject
+        # before reading ExpiresOn. This lets the conservative fallback actually
+        # fire if a module bump ever drops or renames the property.
+        $hasExpiry = $tokenResponse.PSObject.Properties['ExpiresOn'] -and $tokenResponse.ExpiresOn
+        $script:GraphTokenExpiresOn = if ($hasExpiry)
         {
             [datetimeoffset]$tokenResponse.ExpiresOn
         }
@@ -654,13 +660,16 @@ function Resolve-Device
 
     # 3. Fuzzy startswith. Same grouping rule.
     $candidates = @($FuzzyList | Where-Object { $_.Short.StartsWith($short) })
-    $distinctF  = @($candidates.Name | Select-Object -Unique)
 
+    # Check for no candidates BEFORE enumerating .Name — under StrictMode Latest,
+    # member enumeration on an empty array throws rather than returning nothing.
     if ($candidates.Count -eq 0)
     {
         Log-Message -Level WARN -Message "Could not resolve '$DeviceName' in Entra ID — pending registration. Will retry next run." -InvocationName 'Resolve-Device'
         return [pscustomobject]@{ Status = 'Pending'; Ids = @() }
     }
+
+    $distinctF = @($candidates.Name | Select-Object -Unique)
 
     if ($distinctF.Count -eq 1)
     {

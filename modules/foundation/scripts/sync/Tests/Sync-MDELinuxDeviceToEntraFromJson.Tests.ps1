@@ -26,7 +26,7 @@ BeforeAll {
     # ── Stubs — prevent real Az/HTTP calls when dot-sourcing ──────────────────
     function global:Connect-AzAccount         { }
     function global:Disable-AzContextAutosave { }
-    function global:Get-AzAccessToken         { [pscustomobject]@{ Token = 'stub-token' } }
+    function global:Get-AzAccessToken         { [pscustomobject]@{ Token = 'stub-token'; ExpiresOn = [datetimeoffset]::UtcNow.AddHours(1) } }
     function global:Invoke-RestMethod         { [pscustomobject]@{ value = @() } }
 
     # Return a valid JSON config with an empty devices array.
