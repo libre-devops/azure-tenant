@@ -535,7 +535,6 @@ function Invoke-WithRetry
 
 function Build-DeviceIndex
 {
-    # Reads the token from $script:GraphToken so a mid-run refresh is picked up.
     $allDevices = [System.Collections.Generic.List[pscustomobject]]::new()
     $uri = "https://graph.microsoft.com/v1.0/devices?`$select=id,displayName&`$top=999"
 
@@ -544,30 +543,18 @@ function Build-DeviceIndex
         $res = Invoke-WithRetry -OperationName 'Fetch all Entra devices' -ScriptBlock {
             Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "Bearer $script:GraphToken" }
         }
-
-        if ($res.value)
-        {
-            $allDevices.AddRange([pscustomobject[]]$res.value)
-        }
-
-        $uri = if ($res.PSObject.Properties.Name -contains '@odata.nextLink')
-        {
-            $res.'@odata.nextLink'
-        }
-        else
-        {
-            $null
-        }
+        if ($res.value) { $allDevices.AddRange([pscustomobject[]]$res.value) }
+        $uri = if ($res.PSObject.Properties.Name -contains '@odata.nextLink') { $res.'@odata.nextLink' } else { $null }
     }
     while ($uri)
 
-    Log-Message -Level INFO `
-                -Message "Fetched $( $allDevices.Count ) Entra device object(s) into local index." `
-                -InvocationName 'Build-DeviceIndex'
+    Log-Message -Level INFO -Message "Fetched $( $allDevices.Count ) Entra device object(s) into local index." -InvocationName 'Build-DeviceIndex'
 
-    # ── Exact + short index ──────────────────────────────────
-    $deviceIndex = @{}
-    $fuzzyList = [System.Collections.Generic.List[pscustomobject]]::new()
+    # exact: fullName(lower)  → List[string] ids        (>1 = identical-displayName duplicates)
+    # short: shortName(lower) → List[{ Id; Full }]      (lets Resolve tell duplicates from distinct devices)
+    $exactIndex = @{}
+    $shortIndex = @{}
+    $fuzzyList  = [System.Collections.Generic.List[pscustomobject]]::new()
 
     foreach ($d in $allDevices)
     {
@@ -576,79 +563,97 @@ function Build-DeviceIndex
         $full  = $d.displayName.ToLower()
         $short = $full.Split('.')[0]
 
-        # Exact displayName collision = a true duplicate Entra object (common
-        # when a device re-enrolls and the old record lingers). First wins, but
-        # WARN so a wrong/stale target is visible rather than silent. Short-name
-        # collisions are expected (server01.a vs server01.b) and stay quiet.
-        if (-not $deviceIndex.ContainsKey($full))
+        if (-not $exactIndex.ContainsKey($full))
         {
-            $deviceIndex[$full] = $d.id
+            $exactIndex[$full] = [System.Collections.Generic.List[string]]::new()
         }
-        else
-        {
-            Log-Message -Level WARN `
-                -Message "Duplicate Entra displayName '$full' — keeping $( $deviceIndex[$full] ), ignoring $( $d.id ). Likely a stale/re-enrolled object; resolution may target the wrong device. Clean up the duplicate in Entra." `
-                -InvocationName 'Build-DeviceIndex'
-        }
+        $exactIndex[$full].Add($d.id)
 
-        if (-not $deviceIndex.ContainsKey($short))
+        if (-not $shortIndex.ContainsKey($short))
         {
-            $deviceIndex[$short] = $d.id
+            $shortIndex[$short] = [System.Collections.Generic.List[pscustomobject]]::new()
         }
+        $shortIndex[$short].Add([pscustomobject]@{ Id = $d.id; Full = $full })
 
-        $fuzzyList.Add([pscustomobject]@{
-            Name  = $full
-            Short = $short
-            Id    = $d.id
-        })
+        $fuzzyList.Add([pscustomobject]@{ Name = $full; Short = $short; Id = $d.id })
     }
 
-    Log-Message -Level INFO `
-                -Message "Built device index ($( $deviceIndex.Count ) entries) and fuzzy list ($( $fuzzyList.Count ) entries)." `
-                -InvocationName 'Build-DeviceIndex'
+    # WARN on true duplicates (identical displayName, >1 object) so operators can clean up.
+    foreach ($kv in $exactIndex.GetEnumerator())
+    {
+        if ($kv.Value.Count -gt 1)
+        {
+            Log-Message -Level WARN -Message "Duplicate Entra displayName '$( $kv.Key )' → $( $kv.Value.Count ) objects ($( $kv.Value -join ', ' )). All will be synced to keep the live object covered; clean up stale duplicates in Entra." -InvocationName 'Build-DeviceIndex'
+        }
+    }
 
-    return $deviceIndex, $fuzzyList.toArray()
+    Log-Message -Level INFO -Message "Built exact index ($( $exactIndex.Count ) names), short index ($( $shortIndex.Count ) names), fuzzy list ($( $fuzzyList.Count ) entries)." -InvocationName 'Build-DeviceIndex'
+
+    return $exactIndex, $shortIndex, $fuzzyList.ToArray()
 }
 
 function Resolve-Device
 {
     param (
         [string]    $DeviceName,
-        [hashtable] $DeviceIndex,
+        [hashtable] $ExactIndex,
+        [hashtable] $ShortIndex,
         [array]     $FuzzyList
     )
 
     $normalized = $DeviceName.ToLower()
     $short = $normalized.Split('.')[0]
 
-    if ( $DeviceIndex.ContainsKey($normalized))
+    # 1. Exact full displayName. Multiple IDs = identical-displayName duplicates
+    #    (same device re-enrolled). Add ALL so the live object is always covered.
+    if ($ExactIndex.ContainsKey($normalized))
     {
-        Log-Message -Level DEBUG -Message "Resolved '$DeviceName' via exact match → $( $DeviceIndex[$normalized] )" -InvocationName 'Resolve-Device'
-        return [pscustomobject]@{ Status = 'Resolved'; Id = $DeviceIndex[$normalized] }
+        $ids  = @($ExactIndex[$normalized])
+        $note = if ($ids.Count -gt 1) { " ($( $ids.Count ) duplicate objects — adding all)" } else { '' }
+        Log-Message -Level DEBUG -Message "Resolved '$DeviceName' via exact match → $( $ids -join ', ' )$note" -InvocationName 'Resolve-Device'
+        return [pscustomobject]@{ Status = 'Resolved'; Ids = $ids }
     }
 
-    if ( $DeviceIndex.ContainsKey($short))
+    # 2. Short name. Group matches by full displayName:
+    #    one distinct full name → same device (maybe duplicated) → add all
+    #    several distinct names → genuinely different machines     → ambiguous, skip
+    if ($ShortIndex.ContainsKey($short))
     {
-        Log-Message -Level DEBUG -Message "Resolved '$DeviceName' via short-name match → $( $DeviceIndex[$short] )" -InvocationName 'Resolve-Device'
-        return [pscustomobject]@{ Status = 'Resolved'; Id = $DeviceIndex[$short] }
+        $entries  = @($ShortIndex[$short])
+        $distinct = @($entries.Full | Select-Object -Unique)
+
+        if ($distinct.Count -eq 1)
+        {
+            $ids  = @($entries.Id)
+            $note = if ($ids.Count -gt 1) { " ($( $ids.Count ) duplicate objects — adding all)" } else { '' }
+            Log-Message -Level DEBUG -Message "Resolved '$DeviceName' via short-name match → $( $ids -join ', ' )$note" -InvocationName 'Resolve-Device'
+            return [pscustomobject]@{ Status = 'Resolved'; Ids = $ids }
+        }
+
+        Log-Message -Level WARN -Message "Ambiguous short-name match for '$DeviceName' — $( $distinct.Count ) distinct devices share short name '$short': $( $distinct -join ', ' ). Use the FQDN in config. Skipping." -InvocationName 'Resolve-Device'
+        return [pscustomobject]@{ Status = 'Ambiguous'; Ids = @() }
     }
 
+    # 3. Fuzzy startswith. Same grouping rule.
     $candidates = @($FuzzyList | Where-Object { $_.Short.StartsWith($short) })
+    $distinctF  = @($candidates.Name | Select-Object -Unique)
 
-    if ($candidates.Count -eq 1)
+    if ($candidates.Count -eq 0)
     {
-        Log-Message -Level DEBUG -Message "Resolved '$DeviceName' via fuzzy match → '$( $candidates[0].Name )' ($( $candidates[0].Id ))" -InvocationName 'Resolve-Device'
-        return [pscustomobject]@{ Status = 'Resolved'; Id = $candidates[0].Id }
+        Log-Message -Level WARN -Message "Could not resolve '$DeviceName' in Entra ID — pending registration. Will retry next run." -InvocationName 'Resolve-Device'
+        return [pscustomobject]@{ Status = 'Pending'; Ids = @() }
     }
 
-    if ($candidates.Count -gt 1)
+    if ($distinctF.Count -eq 1)
     {
-        Log-Message -Level WARN -Message "Ambiguous fuzzy match for '$DeviceName' — $( $candidates.Count ) candidates: $( ($candidates | Select-Object -ExpandProperty Name) -join ', ' ). Skipping." -InvocationName 'Resolve-Device'
-        return [pscustomobject]@{ Status = 'Ambiguous'; Id = $null }
+        $ids  = @($candidates.Id)
+        $note = if ($ids.Count -gt 1) { " ($( $ids.Count ) duplicate objects — adding all)" } else { '' }
+        Log-Message -Level DEBUG -Message "Resolved '$DeviceName' via fuzzy match → '$( $distinctF[0] )'$note" -InvocationName 'Resolve-Device'
+        return [pscustomobject]@{ Status = 'Resolved'; Ids = $ids }
     }
 
-    Log-Message -Level WARN -Message "Could not resolve '$DeviceName' in Entra ID — pending registration. Will retry next run." -InvocationName 'Resolve-Device'
-    return [pscustomobject]@{ Status = 'Pending'; Id = $null }
+    Log-Message -Level WARN -Message "Ambiguous fuzzy match for '$DeviceName' — $( $distinctF.Count ) candidates: $( $distinctF -join ', ' ). Skipping." -InvocationName 'Resolve-Device'
+    return [pscustomobject]@{ Status = 'Ambiguous'; Ids = @() }
 }
 
 # ============================================================
@@ -999,7 +1004,7 @@ try
 
     # ── Build Entra device index (single Graph call) ──────────────────────────
 
-    $deviceIndex, $fuzzyList = Build-DeviceIndex
+    $exactIndex, $shortIndex, $fuzzyList = Build-DeviceIndex
 
     # ── Process each group ────────────────────────────────────────────────────
 
@@ -1029,19 +1034,19 @@ try
         $resolvedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
 
         foreach ($deviceName in $groupCfg.Devices)
-        {
-            $result = Resolve-Device -DeviceName $deviceName -DeviceIndex $deviceIndex -FuzzyList $fuzzyList
-
-            switch ($result.Status)
             {
-                'Resolved'  {
-                    $resolvedDevices.Add([pscustomobject]@{ Id = $result.Id; DisplayName = $deviceName })
-                }
-                'Pending'   {
-                    $script:PendingCount++;$pendingDevices.Add($deviceName)
-                }
-                'Ambiguous' {
-                    $skippedDevices.Add($deviceName)
+                $result = Resolve-Device -DeviceName $deviceName -ExactIndex $exactIndex -ShortIndex $shortIndex -FuzzyList $fuzzyList
+            
+                switch ($result.Status)
+                {
+                    'Resolved'  {
+                        foreach ($id in $result.Ids)
+                        {
+                            $resolvedDevices.Add([pscustomobject]@{ Id = $id; DisplayName = $deviceName })
+                        }
+                    }
+                    'Pending'   { $script:PendingCount++; $pendingDevices.Add($deviceName) }
+                    'Ambiguous' { $skippedDevices.Add($deviceName) }
                 }
             }
         }
