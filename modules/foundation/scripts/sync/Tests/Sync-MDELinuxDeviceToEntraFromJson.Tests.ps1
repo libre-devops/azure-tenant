@@ -13,12 +13,13 @@
         - Log-Message stream routing (correct stream per level)
         - NormalizeVariableNames (splitting, trimming, deduplication)
         - Sanitize-InputString (quote stripping, whitespace)
-        - Resolve-Device (exact, short-name, fuzzy, ambiguous, pending)
-        - Build-DeviceIndex (index structure, first-write-wins dedup)
+        - Resolve-Device (exact, short-name, fuzzy, ambiguous, pending,
+                          and multi-match add-all for identical displayNames)
+        - Build-DeviceIndex (exact/short/fuzzy structure, duplicate handling)
 
 .NOTES
     Run with:
-        Invoke-Pester ./Sync-MDELinuxDeviceToEntraFromJson.Tests.ps1 -Output Detailed
+        Invoke-Pester ./Tests/Sync-MDELinuxDeviceToEntraFromJson.Tests.ps1 -Output Detailed
 #>
 
 BeforeAll {
@@ -30,14 +31,11 @@ BeforeAll {
 
     # Return a valid JSON config with an empty devices array.
     # MAIN parses it, hits the "no devices — skipping" WARN path, and exits 0
-    # without touching any ERROR logging. This keeps the dot-source clean
-    # regardless of whether the Write-Error bug has been fixed yet.
+    # without building the index or touching any group, so dot-source stays clean.
     function global:Get-AutomationVariable {
         '{"groupId":"00000000-0000-0000-0000-000000000000","name":"stub-group","removeStale":false,"devices":[]}'
     }
 
-    # Dot-source the script so all functions are loaded into scope for testing.
-    # MAIN runs but exits cleanly via the empty-devices path above.
     . "$PSScriptRoot/../Sync-MDELinuxDeviceToEntraFromJson.ps1" `
         -ManagedIdentityClientId 'stub-client-id' `
         -AutomationVariableNames 'GroupConfig-stub'
@@ -62,6 +60,20 @@ Describe 'Log-Message stream routing' {
     It 'WARN goes to Warning stream (stream 3)' {
         $out = Log-Message -Level WARN -Message 'watch-out' -InvocationName 'T' 3>&1
         $out | Should -Match 'watch-out'
+    }
+
+    It 'ERROR does not throw and does not write to Output stream' {
+        # ERROR uses Write-Host (stream 6). Under $ErrorActionPreference=Stop a
+        # Write-Error here would terminate — this guards against regressing to it.
+        $out = $null
+        { $out = Log-Message -Level ERROR -Message 'bad-thing' -InvocationName 'T' } | Should -Not -Throw
+        $out | Should -BeNullOrEmpty
+    }
+
+    It 'STATUS does not write to Output stream' {
+        # STATUS uses Write-Host (stream 6) — must not land on the pipeline.
+        $out = Log-Message -Level STATUS -Message 'milestone' -InvocationName 'T'
+        $out | Should -BeNullOrEmpty
     }
 
     It 'Prefix contains InvocationName in square brackets' {
@@ -147,8 +159,6 @@ Describe 'Sanitize-InputString' {
 
     It 'Returns empty string unchanged' {
         # Requires [AllowEmptyString()] on the Value parameter in the script.
-        # Without it, [Parameter(Mandatory)] rejects empty strings at binding time
-        # with ParameterBindingValidationException before the function body runs.
         Sanitize-InputString -Value '' | Should -BeNullOrEmpty
     }
 
@@ -159,15 +169,27 @@ Describe 'Sanitize-InputString' {
 
 # ============================================================
 #  Resolve-Device
+#
+#  New contract: returns { Status; Ids = @(...) }.
+#    Resolved  → Ids has one or more entries (multiple = identical-name duplicates)
+#    Ambiguous → Ids empty (matches span different displaynames)
+#    Pending   → Ids empty (nothing matched)
 # ============================================================
 
 Describe 'Resolve-Device' {
 
     BeforeAll {
-        $script:Index = @{
-            'server01.contoso.local' = 'id-fqdn'
-            'server01'               = 'id-fqdn'
-            'server02'               = 'id-short'
+        # exact: full displayName → List[string] ids
+        $script:Exact = @{
+            'server01.contoso.local' = [System.Collections.Generic.List[string]]@('id-fqdn')
+            'server02'               = [System.Collections.Generic.List[string]]@('id-short')
+        }
+
+        # short: short name → list of { Id; Full }
+        $script:Short = @{
+            'server01' = @([pscustomobject]@{ Id = 'id-fqdn';  Full = 'server01.contoso.local' })
+            'server02' = @([pscustomobject]@{ Id = 'id-short'; Full = 'server02' })
+            'db01'     = @([pscustomobject]@{ Id = 'id-db';    Full = 'db01.contoso.local' })
         }
 
         $script:Fuzzy = @(
@@ -177,55 +199,100 @@ Describe 'Resolve-Device' {
         )
     }
 
-    It 'Resolves via exact FQDN match' {
-        $r = Resolve-Device -DeviceName 'server01.contoso.local' -DeviceIndex $script:Index -FuzzyList $script:Fuzzy
-        $r.Status | Should -Be 'Resolved'
-        $r.Id     | Should -Be 'id-fqdn'
+    It 'Resolves via exact FQDN match (single id)' {
+        $r = Resolve-Device -DeviceName 'server01.contoso.local' -ExactIndex $script:Exact -ShortIndex $script:Short -FuzzyList $script:Fuzzy
+        $r.Status    | Should -Be 'Resolved'
+        $r.Ids.Count | Should -Be 1
+        $r.Ids[0]    | Should -Be 'id-fqdn'
     }
 
-    It 'Resolves via short-name match' {
-        $r = Resolve-Device -DeviceName 'server02' -DeviceIndex $script:Index -FuzzyList $script:Fuzzy
+    It 'Resolves via short-name match when full name not in exact index' {
+        # 'server01' is not an exact key (only the FQDN is) — falls to short index.
+        $r = Resolve-Device -DeviceName 'server01' -ExactIndex $script:Exact -ShortIndex $script:Short -FuzzyList $script:Fuzzy
         $r.Status | Should -Be 'Resolved'
-        $r.Id     | Should -Be 'id-short'
+        $r.Ids[0] | Should -Be 'id-fqdn'
     }
 
     It 'Resolves via case-insensitive exact match' {
-        $r = Resolve-Device -DeviceName 'SERVER01.CONTOSO.LOCAL' -DeviceIndex $script:Index -FuzzyList $script:Fuzzy
+        $r = Resolve-Device -DeviceName 'SERVER01.CONTOSO.LOCAL' -ExactIndex $script:Exact -ShortIndex $script:Short -FuzzyList $script:Fuzzy
         $r.Status | Should -Be 'Resolved'
+        $r.Ids[0] | Should -Be 'id-fqdn'
     }
 
-    It 'Resolves via fuzzy startswith when not in index' {
-        $r = Resolve-Device -DeviceName 'db01' -DeviceIndex @{} -FuzzyList $script:Fuzzy
+    It 'Resolves via fuzzy startswith when in neither index' {
+        $r = Resolve-Device -DeviceName 'db01' -ExactIndex @{} -ShortIndex @{} -FuzzyList $script:Fuzzy
         $r.Status | Should -Be 'Resolved'
-        $r.Id     | Should -Be 'id-db'
+        $r.Ids[0] | Should -Be 'id-db'
     }
 
-    It 'Returns Ambiguous when fuzzy matches multiple candidates' {
-        $ambiguousFuzzy = @(
-            [pscustomobject]@{ Name = 'web01a'; Short = 'web01a'; Id = 'id-1' }
-            [pscustomobject]@{ Name = 'web01b'; Short = 'web01b'; Id = 'id-2' }
+    It 'Exact match with multiple ids (identical displayName) adds ALL' {
+        $dupExact = @{ 'dup.contoso.local' = [System.Collections.Generic.List[string]]@('id-1', 'id-2') }
+        $r = Resolve-Device -DeviceName 'dup.contoso.local' -ExactIndex $dupExact -ShortIndex @{} -FuzzyList @()
+        $r.Status    | Should -Be 'Resolved'
+        $r.Ids.Count | Should -Be 2
+        $r.Ids       | Should -Contain 'id-1'
+        $r.Ids       | Should -Contain 'id-2'
+    }
+
+    It 'Short match with same full name duplicated adds ALL' {
+        $dupShort = @{ 'dup' = @(
+            [pscustomobject]@{ Id = 'id-1'; Full = 'dup.contoso.local' }
+            [pscustomobject]@{ Id = 'id-2'; Full = 'dup.contoso.local' }
+        ) }
+        $r = Resolve-Device -DeviceName 'dup' -ExactIndex @{} -ShortIndex $dupShort -FuzzyList @()
+        $r.Status    | Should -Be 'Resolved'
+        $r.Ids.Count | Should -Be 2
+    }
+
+    It 'Short match across DIFFERENT full names is Ambiguous (skip)' {
+        $ambShort = @{ 'web01' = @(
+            [pscustomobject]@{ Id = 'id-a'; Full = 'web01.site-a.local' }
+            [pscustomobject]@{ Id = 'id-b'; Full = 'web01.site-b.local' }
+        ) }
+        $r = Resolve-Device -DeviceName 'web01' -ExactIndex @{} -ShortIndex $ambShort -FuzzyList @()
+        $r.Status    | Should -Be 'Ambiguous'
+        $r.Ids.Count | Should -Be 0
+    }
+
+    It 'Fuzzy match across DIFFERENT names is Ambiguous (skip)' {
+        $ambFuzzy = @(
+            [pscustomobject]@{ Name = 'web01a.local'; Short = 'web01a'; Id = 'id-1' }
+            [pscustomobject]@{ Name = 'web01b.local'; Short = 'web01b'; Id = 'id-2' }
         )
-        $r = Resolve-Device -DeviceName 'web01' -DeviceIndex @{} -FuzzyList $ambiguousFuzzy
-        $r.Status | Should -Be 'Ambiguous'
-        $r.Id     | Should -BeNullOrEmpty
+        $r = Resolve-Device -DeviceName 'web01' -ExactIndex @{} -ShortIndex @{} -FuzzyList $ambFuzzy
+        $r.Status    | Should -Be 'Ambiguous'
+        $r.Ids.Count | Should -Be 0
+    }
+
+    It 'Fuzzy match with same full name duplicated adds ALL' {
+        $dupFuzzy = @(
+            [pscustomobject]@{ Name = 'host.local'; Short = 'host'; Id = 'id-1' }
+            [pscustomobject]@{ Name = 'host.local'; Short = 'host'; Id = 'id-2' }
+        )
+        $r = Resolve-Device -DeviceName 'host' -ExactIndex @{} -ShortIndex @{} -FuzzyList $dupFuzzy
+        $r.Status    | Should -Be 'Resolved'
+        $r.Ids.Count | Should -Be 2
     }
 
     It 'Returns Pending when nothing matches' {
-        $r = Resolve-Device -DeviceName 'unknown-host' -DeviceIndex @{} -FuzzyList @()
-        $r.Status | Should -Be 'Pending'
-        $r.Id     | Should -BeNullOrEmpty
+        $r = Resolve-Device -DeviceName 'unknown-host' -ExactIndex @{} -ShortIndex @{} -FuzzyList @()
+        $r.Status    | Should -Be 'Pending'
+        $r.Ids.Count | Should -Be 0
     }
 }
 
 # ============================================================
 #  Build-DeviceIndex
+#
+#  New contract: returns $exactIndex, $shortIndex, $fuzzyList where
+#    $exactIndex[name] = List[string] of ids  (all ids for that displayName)
+#    $shortIndex[short] = list of { Id; Full }
 # ============================================================
 
 Describe 'Build-DeviceIndex' {
 
     BeforeAll {
-        # Bypass Invoke-WithRetry so Build-DeviceIndex executes the scriptblock
-        # directly without any retry/sleep logic or real HTTP calls.
+        # Bypass Invoke-WithRetry so the scriptblock runs directly, no retry/sleep.
         function global:Invoke-WithRetry {
             param ([scriptblock] $ScriptBlock, [string] $OperationName)
             & $ScriptBlock
@@ -241,34 +308,33 @@ Describe 'Build-DeviceIndex' {
         function global:Invoke-RestMethod { $script:StandardPage }
     }
 
-    It 'Indexes the full FQDN lowercased' {
-        $idx, $fl = Build-DeviceIndex -GraphToken 'stub'
-        $idx.ContainsKey('alpha.contoso.local') | Should -BeTrue
+    It 'Exact index contains the full FQDN lowercased' {
+        $exact, $short, $fl = Build-DeviceIndex
+        $exact.ContainsKey('alpha.contoso.local') | Should -BeTrue
     }
 
-    It 'Indexes the short name lowercased' {
-        $idx, $fl = Build-DeviceIndex -GraphToken 'stub'
-        $idx.ContainsKey('alpha') | Should -BeTrue
+    It 'Short index contains the short name lowercased' {
+        $exact, $short, $fl = Build-DeviceIndex
+        $short.ContainsKey('alpha') | Should -BeTrue
     }
 
-    It 'FQDN and short name both resolve to the same Object ID' {
-        $idx, $fl = Build-DeviceIndex -GraphToken 'stub'
-        $idx['alpha.contoso.local'] | Should -Be 'id-alpha'
-        $idx['alpha']               | Should -Be 'id-alpha'
+    It 'Exact index maps a single-object name to its id' {
+        $exact, $short, $fl = Build-DeviceIndex
+        @($exact['alpha.contoso.local'])[0] | Should -Be 'id-alpha'
     }
 
-    It 'Short-name-only device is indexed under its name' {
-        $idx, $fl = Build-DeviceIndex -GraphToken 'stub'
-        $idx.ContainsKey('beta') | Should -BeTrue
-        $idx['beta']             | Should -Be 'id-beta'
+    It 'Short-name-only device is indexed in the exact index under its name' {
+        $exact, $short, $fl = Build-DeviceIndex
+        $exact.ContainsKey('beta')   | Should -BeTrue
+        @($exact['beta'])[0]         | Should -Be 'id-beta'
     }
 
     It 'Fuzzy list contains one entry per device' {
-        $idx, $fl = Build-DeviceIndex -GraphToken 'stub'
+        $exact, $short, $fl = Build-DeviceIndex
         $fl.Count | Should -Be 2
     }
 
-    It 'First-write-wins for duplicate display names' {
+    It 'Identical displayNames keep BOTH ids (multi-match policy)' {
         $dupPage = [pscustomobject]@{
             value = @(
                 [pscustomobject]@{ id = 'first';  displayName = 'dup-host' }
@@ -277,8 +343,10 @@ Describe 'Build-DeviceIndex' {
         }
         function global:Invoke-RestMethod { $dupPage }
 
-        $idx, $fl = Build-DeviceIndex -GraphToken 'stub'
-        $idx['dup-host'] | Should -Be 'first'
+        $exact, $short, $fl = Build-DeviceIndex
+        @($exact['dup-host']).Count | Should -Be 2
+        $exact['dup-host']          | Should -Contain 'first'
+        $exact['dup-host']          | Should -Contain 'second'
     }
 
     It 'Skips devices with no displayName' {
@@ -290,8 +358,8 @@ Describe 'Build-DeviceIndex' {
         }
         function global:Invoke-RestMethod { $nullNamePage }
 
-        $idx, $fl = Build-DeviceIndex -GraphToken 'stub'
-        $idx.ContainsKey('valid-host') | Should -BeTrue
-        $fl.Count                       | Should -Be 1
+        $exact, $short, $fl = Build-DeviceIndex
+        $exact.ContainsKey('valid-host') | Should -BeTrue
+        $fl.Count                        | Should -Be 1
     }
 }
