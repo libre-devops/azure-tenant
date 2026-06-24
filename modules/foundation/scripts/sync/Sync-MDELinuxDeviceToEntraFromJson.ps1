@@ -16,8 +16,24 @@
     2. Short-name (pre-dot) match                         → fast hashtable O(1)
     3. Fuzzy startswith match                             → list scan, skipped if ambiguous
 
-    Ambiguous matches (>1 candidate in step 3) are skipped and logged as WARN. They
-    appear in the summary under SKIPPED and do NOT increment the error count.
+    MULTI-MATCH POLICY
+    ──────────────────
+    A device name may map to more than one Entra object ID. Two distinct cases:
+
+      (a) Identical displayName duplicates — same physical device re-enrolled, the
+          old synthetic object lingering beside the new one. Indistinguishable by
+          name, so ALL matching IDs are added: the live object is always covered and
+          the stale one in the group is harmless. Logged as WARN for cleanup.
+
+      (b) Different FQDNs sharing a short name / prefix — genuinely different machines
+          (server01.site-a vs server01.site-b). Adding both would mis-target a policy,
+          so these stay SKIPPED as Ambiguous. Correct the config with the FQDN.
+
+    The rule: add all IDs that resolve to the SAME displayName; skip when matches span
+    DIFFERENT displaynames.
+
+    Ambiguous matches are skipped and logged as WARN. They appear in the summary under
+    SKIPPED and do NOT increment the error count.
 
     ERROR PHILOSOPHY
     ────────────────
@@ -134,8 +150,9 @@
 
     DUPLICATE DEVICES
         Entra accumulates duplicate device objects as machines re-enroll. The index
-        is first-wins on exact displayName and WARNs on collisions so a stale target
-        is visible. Clean up duplicates in Entra to keep resolution deterministic.
+        keeps ALL IDs per displayName and WARNs on collisions; identical-name
+        duplicates are all synced (see MULTI-MATCH POLICY) so the live object is
+        always covered. Clean up duplicates in Entra to keep the summary tidy.
 #>
 
 [CmdletBinding()]
@@ -535,6 +552,7 @@ function Invoke-WithRetry
 
 function Build-DeviceIndex
 {
+    # Reads the token from $script:GraphToken so a mid-run refresh is picked up.
     $allDevices = [System.Collections.Generic.List[pscustomobject]]::new()
     $uri = "https://graph.microsoft.com/v1.0/devices?`$select=id,displayName&`$top=999"
 
@@ -863,7 +881,7 @@ function Write-SyncSummary
         }
         else
         {
-            Write-Host '    Fuzzy match returned multiple candidates. Correct the device name in config.' -ForegroundColor DarkGray
+            Write-Host '    Resolution returned multiple distinct devices. Use the FQDN in config.' -ForegroundColor DarkGray
             foreach ($name in $r.Skipped)
             {
                 Write-Host "    $name" -ForegroundColor Yellow
@@ -1034,20 +1052,19 @@ try
         $resolvedDevices = [System.Collections.Generic.List[pscustomobject]]::new()
 
         foreach ($deviceName in $groupCfg.Devices)
+        {
+            $result = Resolve-Device -DeviceName $deviceName -ExactIndex $exactIndex -ShortIndex $shortIndex -FuzzyList $fuzzyList
+
+            switch ($result.Status)
             {
-                $result = Resolve-Device -DeviceName $deviceName -ExactIndex $exactIndex -ShortIndex $shortIndex -FuzzyList $fuzzyList
-            
-                switch ($result.Status)
-                {
-                    'Resolved'  {
-                        foreach ($id in $result.Ids)
-                        {
-                            $resolvedDevices.Add([pscustomobject]@{ Id = $id; DisplayName = $deviceName })
-                        }
+                'Resolved'  {
+                    foreach ($id in $result.Ids)
+                    {
+                        $resolvedDevices.Add([pscustomobject]@{ Id = $id; DisplayName = $deviceName })
                     }
-                    'Pending'   { $script:PendingCount++; $pendingDevices.Add($deviceName) }
-                    'Ambiguous' { $skippedDevices.Add($deviceName) }
                 }
+                'Pending'   { $script:PendingCount++; $pendingDevices.Add($deviceName) }
+                'Ambiguous' { $skippedDevices.Add($deviceName) }
             }
         }
 
