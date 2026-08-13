@@ -468,6 +468,97 @@ Describe 'Sanitize-InputString' {
 }
 
 # ============================================================
+#  ConvertTo-Bool and Resolve-BooleanParameter
+#
+#  Azure Automation hands job schedule parameters over as strings, and a plain
+#  [bool] cast makes EVERY non-empty string $true. A field reading 'false' would
+#  mean the opposite of what it says.
+# ============================================================
+
+Describe 'ConvertTo-Bool' {
+
+    It 'Converts <Value> to <Expected>' -TestCases @(
+        @{ Value = 'true';  Expected = $true  }
+        @{ Value = 'TRUE';  Expected = $true  }
+        @{ Value = 'True';  Expected = $true  }
+        @{ Value = '1';     Expected = $true  }
+        @{ Value = 'yes';   Expected = $true  }
+        @{ Value = 'Y';     Expected = $true  }
+        @{ Value = 'false'; Expected = $false }
+        @{ Value = 'FALSE'; Expected = $false }
+        @{ Value = 'False'; Expected = $false }
+        @{ Value = '0';     Expected = $false }
+        @{ Value = 'no';    Expected = $false }
+        @{ Value = 'N';     Expected = $false }
+    ) {
+        param ($Value, $Expected)
+        ConvertTo-Bool -Value $Value | Should -Be $Expected
+    }
+
+    It "Converts 'false' to FALSE, which a [bool] cast does not" {
+        # The whole reason this function exists.
+        [bool]'false'              | Should -BeTrue    # the trap
+        ConvertTo-Bool -Value 'false' | Should -BeFalse   # the fix
+    }
+
+    It 'Tolerates surrounding whitespace' {
+        ConvertTo-Bool -Value '  false  ' | Should -BeFalse
+        ConvertTo-Bool -Value "`ttrue`t"  | Should -BeTrue
+    }
+
+    It 'Treats empty and whitespace as false' {
+        ConvertTo-Bool -Value ''    | Should -BeFalse
+        ConvertTo-Bool -Value '   ' | Should -BeFalse
+        ConvertTo-Bool -Value $null | Should -BeFalse
+    }
+
+    It 'Throws on <Value> rather than guessing' -TestCases @(
+        @{ Value = 'ture' }
+        @{ Value = 'flase' }
+        @{ Value = 'maybe' }
+        @{ Value = '2' }
+        @{ Value = '$false' }
+    ) {
+        param ($Value)
+        { ConvertTo-Bool -Value $Value } | Should -Throw
+    }
+}
+
+Describe 'Resolve-BooleanParameter' {
+
+    It 'Passes a real boolean straight through' {
+        Resolve-BooleanParameter -Value $true  -Default $false -Name 'T' | Should -BeTrue
+        Resolve-BooleanParameter -Value $false -Default $true  -Name 'T' | Should -BeFalse
+    }
+
+    It 'An EMPTY field takes the default, and does not mean false' {
+        # The trap this wrapper exists for. ConvertTo-Bool maps empty to $false,
+        # which is right for a flag defaulting off and wrong for
+        # DefaultRemoveStale, whose default is $true. Clearing the schedule field
+        # must not silently disable stale removal across every group.
+        Resolve-BooleanParameter -Value ''    -Default $true -Name 'DefaultRemoveStale' | Should -BeTrue
+        Resolve-BooleanParameter -Value '   ' -Default $true -Name 'DefaultRemoveStale' | Should -BeTrue
+        Resolve-BooleanParameter -Value $null -Default $true -Name 'DefaultRemoveStale' | Should -BeTrue
+    }
+
+    It 'An empty field still takes a false default' {
+        Resolve-BooleanParameter -Value '' -Default $false -Name 'DryRun' | Should -BeFalse
+    }
+
+    It 'A supplied string overrides the default in both directions' {
+        Resolve-BooleanParameter -Value 'false' -Default $true  -Name 'T' | Should -BeFalse
+        Resolve-BooleanParameter -Value 'true'  -Default $false -Name 'T' | Should -BeTrue
+        Resolve-BooleanParameter -Value 'no'    -Default $true  -Name 'T' | Should -BeFalse
+    }
+
+    It 'Throws on a typo rather than falling back to the default' {
+        # Falling back would be worse than failing: the job would run in a mode
+        # nobody asked for, and the schedule would still read 'flase'.
+        { Resolve-BooleanParameter -Value 'flase' -Default $true -Name 'T' } | Should -Throw
+    }
+}
+
+# ============================================================
 #  Resolve-Device
 #
 #  Contract: returns { Status; Ids = @(...) }.

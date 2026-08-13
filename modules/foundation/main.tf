@@ -372,12 +372,23 @@ resource "azurerm_automation_job_schedule" "runbook_schedule_group_sync" {
   runbook_name  = azurerm_automation_runbook.runbook_group_sync.name
   schedule_name = azurerm_automation_schedule.every_60_min.name
 
-  # Parameter names must be lowercase — Azure SDK limitation.
-  # Only pass string/string-array params. DefaultRemoveStale and WhatIf are
-  # intentionally OMITTED: Azure Automation binds schedule params as strings, and
-  # [bool]"false" evaluates to $true in PowerShell — so passing them risks silently
-  # flipping the runbook into WhatIf (no-op) mode. The in-script defaults
-  # ($DefaultRemoveStale = $true, $WhatIf = $false) already match the intent.
+  # Parameter names must be lowercase, an Azure SDK limitation.
+  #
+  # Azure Automation binds every schedule parameter as a string, and [bool]"false"
+  # evaluates to $true in PowerShell, so the runbook takes its booleans untyped and
+  # converts them with ConvertTo-Bool. "false", "0" and "no" all mean false, an
+  # empty field means "not supplied" and keeps the in-script default, and anything
+  # unrecognised throws and fails the job rather than guessing a mode.
+  #
+  # So these ARE safe to pass now, and are omitted only because the in-script
+  # defaults already match the intent:
+  #
+  #   defaultremovestale = "true"   remove group members not present in the config
+  #   dryrun             = "false"  set "true" to rehearse a run without writing
+  #   logformat          = "Text"   "Json" emits OpenTelemetry records instead
+  #
+  # Adding dryrun = "true" here is the supported way to rehearse a config change
+  # without republishing the runbook.
   parameters = {
     managedidentityclientid = module.user_assigned_managed_identity.managed_identity_client_ids[module.shared_vars.foundation_uid_name]
     automationvariablenames = local.automation_variable_names

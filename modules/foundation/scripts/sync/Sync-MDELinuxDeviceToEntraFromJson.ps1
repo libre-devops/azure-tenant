@@ -104,8 +104,19 @@
 
 .PARAMETER DefaultRemoveStale
     Global fallback for removeStale when not specified per group. Default: $true.
-    Do NOT pass from job schedule: [bool] binding from string is unreliable in
-    Azure Automation. Change the default here if needed.
+
+    Safe to pass from a job schedule. Accepts true/false, 1/0, yes/no, y/n, in
+    any case. An EMPTY schedule field means "not supplied" and keeps the $true
+    default; it does not mean false. An unrecognised value throws and fails the
+    job rather than guessing.
+
+.PARAMETER DryRun
+    If true, the run resolves and diffs everything but writes nothing to any
+    group. Sets $WhatIfPreference, which the ShouldProcess gates in
+    Add-DeviceToGroup and Remove-DeviceFromGroup read. Default: false. Accepts
+    the same values as DefaultRemoveStale, and an empty field means false.
+
+    A dry run also bypasses the blast-radius guard, since nothing is written.
 
 .PARAMETER MaxRetries / RetryDelaySeconds
     Retry configuration for TRANSIENT API failures only: 408, 429 and 5xx. A 403
@@ -143,13 +154,14 @@
     each stays under the limit. A WhatIf run bypasses the guard.
 
     DRY RUN
-    There is no -WhatIf parameter. Set $WhatIfPreference = $true at script scope
-    (the assignment sits just below the param block) for a no-write rehearsal.
-    The two leaf write functions declare SupportsShouldProcess and gate every
-    Graph write on $PSCmdlet.ShouldProcess, which reads that preference from the
-    calling scope. It is deliberately not a parameter, for the same reason
-    DefaultRemoveStale is not: Azure Automation binds job schedule parameters as
-    strings and [bool]'false' is $true.
+    Pass -DryRun true for a no-write rehearsal. The two leaf write functions
+    declare SupportsShouldProcess and gate every Graph write on
+    $PSCmdlet.ShouldProcess, which reads $WhatIfPreference from the calling
+    scope, and MAIN sets that preference from -DryRun.
+
+    There is no -WhatIf parameter, because a parameter of that name on a script
+    that does not declare SupportsShouldProcess reads like a real one and is not.
+    DryRun says what it does.
 
 .NOTES
     ─────────────────────────────────────────────────────────────────────────────
@@ -235,8 +247,20 @@ param (
     [Parameter(Mandatory)]
     $AutomationVariableNames,
 
-# Do NOT pass this from the job schedule: [bool] from string is unreliable.
-    [bool] $DefaultRemoveStale = $true,
+# Untyped for the same reason as AutomationVariableNames: Azure Automation hands
+# job schedule parameters over as strings, and a [bool] parameter would bind
+# 'false' to $true because every non-empty string casts true. Resolved in MAIN by
+# Resolve-BooleanParameter, which converts strictly and throws on anything it
+# does not recognise. The default is a real [bool] so that leaving the schedule
+# field EMPTY keeps this default rather than being read as 'false'.
+# Safe to pass from a job schedule as 'true'/'false'/'1'/'0'/'yes'/'no'.
+    $DefaultRemoveStale = $true,
+
+# Dry run. Same handling. Sets $WhatIfPreference in MAIN, which the ShouldProcess
+# gates in the two leaf write functions read, so 'true' here means the run
+# resolves and diffs everything but writes nothing. Being a schedule parameter
+# rather than a source edit means a rehearsal needs no runbook republish.
+    $DryRun = $false,
 
     [int] $MaxRetries = 6,
     [int] $RetryDelaySeconds = 20,
@@ -271,9 +295,13 @@ $ConfirmPreference = 'None'
 
 # Dry run switch. $true means nothing is written to any group: ShouldProcess in
 # the two leaf write functions reads this preference from the calling scope and
-# returns false, so both return before touching Graph. Set in source rather than
-# taken as a parameter, because Azure Automation binds job schedule parameters as
-# strings and [bool]'false' is $true, which would silently no-op the whole run.
+# returns false, so both return before touching Graph.
+#
+# Initialised to $false HERE, then set from the -DryRun parameter in MAIN once
+# Resolve-BooleanParameter has converted it. The old comment on this line claimed
+# a dry run could not be a parameter because Azure Automation binds job schedule
+# parameters as strings and [bool]'false' is $true. That is true of a [bool]
+# parameter and false of a converted one, so it is now a parameter.
 $WhatIfPreference = $false
 
 $script:SyncErrorCount = 0
@@ -584,6 +612,107 @@ function Sanitize-InputString
     }
 
     return $Value
+}
+
+function ConvertTo-Bool
+{
+    <#
+    .SYNOPSIS
+        Converts a string to a boolean safely.
+    .DESCRIPTION
+        Inlined from ConvertTo-LdoBoolean in
+        LibreDevOpsHelpers/LibreDevOpsHelpers.Utils (main, fad5981), renamed to drop
+        the module prefix and adapted to log through Log-Message rather than
+        Write-LdoLog. The conversion semantics are unchanged. Copied rather than imported on
+        purpose: this runbook is published as standalone content into a runtime
+        environment that pins Az and nothing else, and MODULE PINNING in .NOTES
+        calls module drift the number one silent breaker of long-lived runbooks.
+        Twelve lines is a better trade than a second module asset.
+
+        Accepts true/false, 1/0, yes/no and y/n (case-insensitive). Empty or
+        whitespace becomes $false. Anything else THROWS, which is the entire
+        point: a plain [bool] cast makes every non-empty string $true, so
+        [bool]'false' is $true and a job schedule field reading 'false' would
+        silently mean the opposite of what it says.
+
+        Keep this in step with the helper module if that one changes.
+    #>
+    [OutputType([bool])]
+    param (
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value))
+    {
+        return $false
+    }
+
+    switch ($Value.Trim().ToLowerInvariant())
+    {
+        { $_ -in 'true', '1', 'yes', 'y' } { return $true }
+        { $_ -in 'false', '0', 'no', 'n' } { return $false }
+        default
+        {
+            $message = "Cannot convert '$Value' to a boolean. Expected true/false, 1/0, yes/no."
+            Log-Message -Level ERROR -Message $message -InvocationName 'ConvertTo-Bool'
+            throw $message
+        }
+    }
+}
+
+function Resolve-BooleanParameter
+{
+    <#
+    .SYNOPSIS
+        Resolves a job schedule parameter that means a boolean.
+    .DESCRIPTION
+        Azure Automation hands every job schedule parameter over as a string, so
+        these parameters are declared untyped and normalised here.
+
+        Three cases, and the middle one is the one that bites:
+
+          already a [bool]   The parameter was not supplied and kept its
+                             in-script default, or a caller passed a real
+                             boolean. Use it as-is.
+          null or blank      An EMPTY schedule field. This means "not supplied",
+                             so it takes $Default. It must NOT go through
+                             ConvertTo-Bool, whose empty case is $false:
+                             for DefaultRemoveStale (default $true) that would
+                             silently disable stale removal across every group
+                             the moment someone cleared the field.
+          anything else      Converted strictly, throwing on an unrecognised
+                             value so a typo fails the job loudly rather than
+                             flipping a security control into no-op mode.
+    #>
+    [OutputType([bool])]
+    param (
+        $Value,
+        [bool]   $Default,
+        [string] $Name
+    )
+
+    if ($Value -is [bool])
+    {
+        return $Value
+    }
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value))
+    {
+        Log-Message -Level DEBUG `
+                    -Message "Parameter '$Name' was not supplied. Using the in-script default: $Default." `
+                    -InvocationName 'Resolve-BooleanParameter'
+        return $Default
+    }
+
+    $resolved = ConvertTo-Bool -Value ([string]$Value)
+
+    Log-Message -Level INFO `
+                -Message "Parameter '$Name' supplied as '$Value', resolved to $resolved." `
+                -InvocationName 'Resolve-BooleanParameter'
+
+    return $resolved
 }
 
 function Get-GraphErrorInfo
@@ -1533,6 +1662,16 @@ try
     $ManagedIdentityClientId = Sanitize-InputString -Value $ManagedIdentityClientId
     $AutomationVariableNames = Sanitize-InputString -Value $AutomationVariableNames
     $AutomationVariableNames = NormalizeVariableNames -Names $AutomationVariableNames
+
+    # Booleans arrive from a job schedule as strings. Resolve them BEFORE the
+    # startup banner so the banner reports what the run will actually do, and
+    # inside the try so a bad value is logged as FATAL rather than dying
+    # unhandled. An unrecognised value throws here and fails the job, which is
+    # the point: better a loud failure than a security control silently running
+    # in the opposite mode to the one the schedule field says.
+    $DefaultRemoveStale = Resolve-BooleanParameter -Value $DefaultRemoveStale -Default $true  -Name 'DefaultRemoveStale'
+    $DryRun             = Resolve-BooleanParameter -Value $DryRun             -Default $false -Name 'DryRun'
+    $WhatIfPreference   = $DryRun
 
     Log-Message -Level STATUS `
                 -Message "========== Sync started | Variables: '$( $AutomationVariableNames -join "', '" )' | DefaultRemoveStale: $DefaultRemoveStale | WhatIf: $WhatIfPreference | LogFormat: $script:LogFormat ==========" `
