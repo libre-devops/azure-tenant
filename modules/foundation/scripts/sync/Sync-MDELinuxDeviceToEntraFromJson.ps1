@@ -1,7 +1,7 @@
 #Requires -Version 7.2
 <#
 .SYNOPSIS
-    Azure Automation Runbook — Syncs explicitly-configured devices into Entra ID security
+    Azure Automation Runbook. Syncs explicitly-configured devices into Entra ID security
     groups using per-group JSON definitions stored in Azure Automation Variables.
 
 .DESCRIPTION
@@ -25,12 +25,12 @@
     ──────────────────
     A device name may map to more than one Entra object ID. Two distinct cases:
 
-      (a) Identical displayName duplicates — same physical device re-enrolled, the
+      (a) Identical displayName duplicates: same physical device re-enrolled, the
           old synthetic object lingering beside the new one. Indistinguishable by
           name, so ALL matching IDs are added: the live object is always covered and
           the stale one in the group is harmless. Logged as WARN for cleanup.
 
-      (b) Different FQDNs sharing a short name — genuinely different machines
+      (b) Different FQDNs sharing a short name: genuinely different machines
           (server01.site-a vs server01.site-b). Adding both would mis-target a policy,
           so these stay SKIPPED as Ambiguous. Correct the config with the FQDN.
 
@@ -42,10 +42,10 @@
 
     ERROR PHILOSOPHY
     ────────────────
-    $script:SyncErrorCount — genuine API / group operation failures only.
-    $script:PendingCount   — devices not found in Entra (expected during propagation).
+    $script:SyncErrorCount : genuine API / group operation failures only.
+    $script:PendingCount   : devices not found in Entra (expected during propagation).
 
-    Groups with an empty devices array are skipped with WARN — not counted as errors.
+    Groups with an empty devices array are skipped with WARN, not counted as errors.
     This allows partial rollout (some groups configured, others not yet) without
     failing the job and triggering the Azure Monitor alert.
 
@@ -54,19 +54,19 @@
     LOGGING
     ───────
     Log levels map onto streams chosen so nothing ever lands on the SUCCESS stream
-    inside a value-returning function (that would corrupt the return value — the
+    inside a value-returning function (that would corrupt the return value, the
     classic way the Graph token gets mangled into "Bearer <logline> <token>").
 
     DEBUG   → Write-Verbose : low-level detail. All Logs tab only, when verbose on.
     INFO    → Write-Verbose : operational steps. All Logs tab only, when verbose on.
     STATUS  → Write-Host    : key milestones (start, per-group result, totals).
-                              ALWAYS visible, even with verbose off — the baseline
+                              ALWAYS visible, even with verbose off, the baseline
                               audit trail. Information stream (6), safe in functions.
     WARN    → Write-Warning : Warnings tab + All Logs. Always visible.
-    ERROR   → Write-Host    : failures. Always visible. NON-terminating on purpose —
+    ERROR   → Write-Host    : failures. Always visible. NON-terminating on purpose.
                               Write-Error would throw under $ErrorActionPreference=Stop
                               and defeat the count-and-continue design.
-    Write-Output            : NEVER used — enters the success pipeline and corrupts
+    Write-Output            : NEVER used: it enters the success pipeline and
                               function return values.
 
     That routing is fixed. The RENDERING is selectable via -LogFormat:
@@ -104,7 +104,7 @@
 
 .PARAMETER DefaultRemoveStale
     Global fallback for removeStale when not specified per group. Default: $true.
-    Do NOT pass from job schedule — [bool] binding from string is unreliable in
+    Do NOT pass from job schedule: [bool] binding from string is unreliable in
     Azure Automation. Change the default here if needed.
 
 .PARAMETER MaxRetries / RetryDelaySeconds
@@ -167,7 +167,7 @@
     }
 
     ─────────────────────────────────────────────────────────────────────────────
-    REQUIRED MANAGED IDENTITY — API PERMISSIONS
+    REQUIRED MANAGED IDENTITY: API PERMISSIONS
     ─────────────────────────────────────────────────────────────────────────────
 
     ┌─────────────────────────┬──────────────────────────────┬──────────────────────────────────┐
@@ -189,7 +189,7 @@
     Entra directory role with action
     'microsoft.directory/groups.security.assignedMembership/members/update',
     scoped to the target groups. Note that action only covers ASSIGNED-membership
-    security groups — not dynamic or M365/mail-enabled groups.
+    security groups, not dynamic or M365/mail-enabled groups.
 
     ─────────────────────────────────────────────────────────────────────────────
     LONG-RUNNING RELIABILITY  (this runbook is expected to run unattended for years)
@@ -204,8 +204,8 @@
     TOKEN HANDLING
         Get-GraphToken caches the Graph token at script scope and auto-refreshes
         when it is missing or within 5 minutes of expiry. It is called before each
-        group, and Invoke-WithRetry force-refreshes on a 401 — so a job that runs
-        longer than the ~60–90 min token lifetime (large tenants / many groups)
+        group, and Invoke-WithRetry force-refreshes on a 401, so a job that runs
+        longer than the ~60 to 90 min token lifetime (large tenants / many groups)
         does not fail on an expired token. Token extraction handles BOTH a plaintext
         string and a SecureString (.Token became SecureString-by-default in
         Az.Accounts 5.x) so a module bump can't silently produce a bad token.
@@ -230,12 +230,12 @@ param (
 # work, there is no fallback. See Initialize-ManagedIdentityAuth.
     [string] $ManagedIdentityClientId = '',
 
-# Intentionally untyped — arrives as System.String from job schedule.
+# Intentionally untyped: arrives as System.String from job schedule.
 # NormalizeVariableNames handles splitting inside MAIN.
     [Parameter(Mandatory)]
     $AutomationVariableNames,
 
-# Do NOT pass this from the job schedule — [bool] from string is unreliable.
+# Do NOT pass this from the job schedule: [bool] from string is unreliable.
     [bool] $DefaultRemoveStale = $true,
 
     [int] $MaxRetries = 6,
@@ -252,7 +252,7 @@ param (
 # Blast-radius guard for stale removal. A single run that would remove MORE than
 # StaleRemovalMinCount members AND MORE than StaleRemovalMaxPercent of a group's
 # current membership is aborted for that group and fails the job. BOTH thresholds
-# must be exceeded — the percentage stops large-group wipeouts, the absolute floor
+# must be exceeded: the percentage stops large-group wipeouts, the absolute floor
 # stops false positives on tiny groups (20% of 1 rounds to 0). Stage genuine bulk
 # removals across multiple runs.
     [int]    $StaleRemovalMinCount   = 5,
@@ -292,7 +292,7 @@ $script:GraphTokenExpiresOn = [datetimeoffset]::MinValue
 #  WARN       → Write-Warning : Warnings tab + All Logs.
 #  ERROR      → Write-Host    : failures, ALWAYS visible, non-terminating.
 #  None touch the SUCCESS stream, so they are safe inside returning functions.
-#  Write-Output is NEVER used — it corrupts function return values (and tokens).
+#  Write-Output is NEVER used: it corrupts function return values (and tokens).
 #
 #  ROUTING IS FIXED, RENDERING IS NOT.
 #  The stream each level goes to is a hard constraint of this runbook and does
@@ -481,19 +481,19 @@ function Log-Message
     {
         'DEBUG'  {
             Write-Verbose $line
-        }                                           # All Logs only — low-level detail
+        }                                           # All Logs only, low-level detail
         'INFO'   {
             Write-Verbose $line
-        }                                           # All Logs only — operational steps (verbose)
+        }                                           # All Logs only, operational steps (verbose)
         'STATUS' {
             Write-LogHostLine -Line $line -Color Cyan
-        }              # Always visible — milestone/audit baseline
+        }              # Always visible, milestone/audit baseline
         'WARN'   {
             Write-Warning $line
         }                                           # Warnings tab + All Logs
         'ERROR'  {
             Write-LogHostLine -Line $line -Color Red
-        }               # Always visible — non-terminating (Write-Error throws under -EAP Stop)
+        }               # Always visible, non-terminating (Write-Error throws under -EAP Stop)
     }
 }
 
@@ -506,7 +506,7 @@ function NormalizeVariableNames
     <#
     .SYNOPSIS
         Splits, trims, and dedupes the AutomationVariableNames input.
-        Called inside MAIN's try block — never at script scope — so any
+        Called inside MAIN's try block (never at script scope) so any
         failure is caught and logged before propagating.
     #>
     param ($Names)
@@ -764,7 +764,7 @@ function Get-GraphToken
     .DESCRIPTION
         Caches the token at script scope and re-acquires it when missing, forced,
         or within 5 minutes of expiry. Called before each group, and force-refreshed
-        on a 401 inside Invoke-WithRetry, so a run that outlives the ~60–90 min token
+        on a 401 inside Invoke-WithRetry, so a run that outlives the ~60 to 90 min token
         lifetime (large tenants / many groups) does not fail on an expired token.
         Handles both plaintext and SecureString .Token (SecureString became the
         Az.Accounts 5.x default) so a pinned-module bump can't silently break auth.
@@ -789,7 +789,7 @@ function Get-GraphToken
 
         if (-not $tokenResponse.Token)
         {
-            throw 'Token extraction failed — response contained no token.'
+            throw 'Token extraction failed: response contained no token.'
         }
 
         # .Token may be a SecureString OR a plaintext string depending on the pinned
@@ -808,13 +808,13 @@ function Get-GraphToken
 
         if ([string]::IsNullOrWhiteSpace($token) -or $token -eq 'System.Security.SecureString')
         {
-            throw 'Token extraction produced an empty or unconverted value — check the Az.Accounts module version.'
+            throw 'Token extraction produced an empty or unconverted value. Check the Az.Accounts module version.'
         }
 
         $script:GraphToken = $token
 
         # Under Set-StrictMode -Version Latest, referencing a missing property
-        # THROWS rather than returning $null — so probe for existence via PSObject
+        # THROWS rather than returning $null, so probe for existence via PSObject
         # before reading ExpiresOn. This lets the conservative fallback actually
         # fire if a module bump ever drops or renames the property.
         $hasExpiry = $tokenResponse.PSObject.Properties['ExpiresOn'] -and $tokenResponse.ExpiresOn
@@ -932,7 +932,7 @@ function Invoke-WithRetry
             # HttpResponseHeaders has NO string indexer. The old
             # $...Headers?['Retry-After'] threw "Unable to index into an object
             # of type System.Net.Http.Headers.HttpResponseHeaders" from inside
-            # this catch — which masked the real Graph error AND broke 429
+            # this catch, which masked the real Graph error AND broke 429
             # backoff. TryGetValues is the supported access path.
             if ($resp)
             {
@@ -1054,7 +1054,7 @@ function Resolve-Device
     if ($ExactIndex.ContainsKey($normalized))
     {
         $ids  = @($ExactIndex[$normalized])
-        $note = if ($ids.Count -gt 1) { " ($( $ids.Count ) duplicate objects — adding all)" } else { '' }
+        $note = if ($ids.Count -gt 1) { " ($( $ids.Count ) duplicate objects, adding all)" } else { '' }
         Log-Message -Level DEBUG -Message "Resolved '$DeviceName' via exact match → $( $ids -join ', ' )$note" -InvocationName 'Resolve-Device'
         return [pscustomobject]@{ Status = 'Resolved'; Ids = $ids }
     }
@@ -1070,19 +1070,19 @@ function Resolve-Device
         if ($distinct.Count -eq 1)
         {
             $ids  = @($entries.Id)
-            $note = if ($ids.Count -gt 1) { " ($( $ids.Count ) duplicate objects — adding all)" } else { '' }
+            $note = if ($ids.Count -gt 1) { " ($( $ids.Count ) duplicate objects, adding all)" } else { '' }
             Log-Message -Level DEBUG -Message "Resolved '$DeviceName' via short-name match → $( $ids -join ', ' )$note" -InvocationName 'Resolve-Device'
             return [pscustomobject]@{ Status = 'Resolved'; Ids = $ids }
         }
 
-        Log-Message -Level WARN -Message "Ambiguous short-name match for '$DeviceName' — $( $distinct.Count ) distinct devices share short name '$short': $( $distinct -join ', ' ). Use the FQDN in config. Skipping." -InvocationName 'Resolve-Device'
+        Log-Message -Level WARN -Message "Ambiguous short-name match for '$DeviceName': $( $distinct.Count ) distinct devices share short name '$short': $( $distinct -join ', ' ). Use the FQDN in config. Skipping." -InvocationName 'Resolve-Device'
         return [pscustomobject]@{ Status = 'Ambiguous'; Ids = @() }
     }
 
     # Neither tier matched. Pending is the safe answer: the device may simply not
     # have propagated into Entra yet, and the next run will pick it up. Guessing
     # by prefix is what put the wrong host in an EDR policy group.
-    Log-Message -Level WARN -Message "Could not resolve '$DeviceName' in Entra ID — pending registration. Will retry next run." -InvocationName 'Resolve-Device'
+    Log-Message -Level WARN -Message "Could not resolve '$DeviceName' in Entra ID, pending registration. Will retry next run." -InvocationName 'Resolve-Device'
     return [pscustomobject]@{ Status = 'Pending'; Ids = @() }
 }
 
@@ -1445,7 +1445,7 @@ function Write-SyncSummary
         Write-Host "  ADDED THIS RUN ($( $r.Added.Count ))" -ForegroundColor Green
         if ($r.Added.Count -eq 0)
         {
-            Write-Host '    (none — all resolved devices were already members)' -ForegroundColor DarkGray
+            Write-Host '    (none, all resolved devices were already members)' -ForegroundColor DarkGray
         }
         else
         {
@@ -1485,7 +1485,7 @@ function Write-SyncSummary
         }
 
         Write-Host ''
-        Write-Host "  SKIPPED — AMBIGUOUS RESOLUTION ($( $r.Skipped.Count ))" -ForegroundColor Yellow
+        Write-Host "  SKIPPED: AMBIGUOUS RESOLUTION ($( $r.Skipped.Count ))" -ForegroundColor Yellow
         if ($r.Skipped.Count -eq 0)
         {
             Write-Host '    (none)' -ForegroundColor DarkGray
@@ -1520,7 +1520,7 @@ function Write-SyncSummary
 #  MAIN
 #
 #  Everything runs inside a single top-level try/catch.
-#  Nothing executes at script scope outside function definitions — that pattern
+#  Nothing executes at script scope outside function definitions: that pattern
 #  causes unhandled exceptions before any logging is active, producing the
 #  "job failed, no output".
 # ============================================================
@@ -1585,11 +1585,11 @@ try
                 $cfg.groupId
             }
 
-            # Empty devices array = group not yet configured. Skip with WARN — not an error.
+            # Empty devices array = group not yet configured. Skip with WARN, not an error.
             # This allows partial rollout without failing the job and firing the monitor alert.
             if (-not $cfg.devices -or @($cfg.devices).Count -eq 0)
             {
-                Log-Message -Level WARN -Message "Variable '$varName' has no devices configured — skipping group '$displayName'. Add devices to the JSON to enable sync." -InvocationName 'MAIN'
+                Log-Message -Level WARN -Message "Variable '$varName' has no devices configured, skipping group '$displayName'. Add devices to the JSON to enable sync." -InvocationName 'MAIN'
                 continue
             }
 
@@ -1691,7 +1691,7 @@ try
         # turn.
         try
         {
-            # Refresh the token if it is close to expiry — keeps long, many-group runs alive.
+            # Refresh the token if it is close to expiry. Keeps long, many-group runs alive.
             Get-GraphToken | Out-Null
 
             Log-Message -Level STATUS `
@@ -1774,7 +1774,7 @@ try
                 {
                     $script:SyncErrorCount++
                     Log-Message -Level ERROR `
-                        -Message ("BLAST-RADIUS GUARD: '$groupName' would remove $staleCount of $memberCount device member(s) ({0:P1}) — exceeds limit (>{1} devices AND >{2:P0}). Skipping ALL removals for this group; stage the change across multiple runs. Run will fail." -f $stalePercent, $StaleRemovalMinCount, $StaleRemovalMaxPercent) `
+                        -Message ("BLAST-RADIUS GUARD: '$groupName' would remove $staleCount of $memberCount device member(s) ({0:P1}), which exceeds the limit (>{1} devices AND >{2:P0}). Skipping ALL removals for this group; stage the change across multiple runs. Run will fail." -f $stalePercent, $StaleRemovalMinCount, $StaleRemovalMaxPercent) `
                         -InvocationName 'MAIN'
                 }
                 else
@@ -1851,7 +1851,7 @@ try
 
     if ($script:SyncErrorCount -gt 0)
     {
-        throw "Sync finished with $script:SyncErrorCount API error(s). Review job output above. ($script:PendingCount device(s) pending Entra registration — these will retry automatically.)"
+        throw "Sync finished with $script:SyncErrorCount API error(s). Review job output above. ($script:PendingCount device(s) pending Entra registration. These will retry automatically.)"
     }
 }
 catch

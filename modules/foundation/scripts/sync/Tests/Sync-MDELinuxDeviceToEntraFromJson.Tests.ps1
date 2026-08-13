@@ -5,7 +5,7 @@
     Smoke tests for Sync-MDELinuxDeviceToEntraFromJson.ps1
 
 .DESCRIPTION
-    Tests pure in-memory logic only — no API calls, no Azure credentials.
+    Tests pure in-memory logic only: no API calls, no Azure credentials.
     Stubs are defined in BeforeAll to prevent the script body from making
     any real network or authentication calls when dot-sourced.
 
@@ -33,14 +33,14 @@
 #>
 
 BeforeAll {
-    # ── Stubs — prevent real Az/HTTP calls when dot-sourcing ──────────────────
+    # ── Stubs: prevent real Az/HTTP calls when dot-sourcing ──────────────────
     function global:Connect-AzAccount         { }
     function global:Disable-AzContextAutosave { }
     function global:Get-AzAccessToken         { [pscustomobject]@{ Token = 'stub-token'; ExpiresOn = [datetimeoffset]::UtcNow.AddHours(1) } }
     function global:Invoke-RestMethod         { [pscustomobject]@{ value = @() } }
 
     # Return a valid JSON config with an empty devices array.
-    # MAIN parses it, hits the "no devices — skipping" WARN path, and exits 0
+    # MAIN parses it, hits the "no devices configured" WARN path, and exits 0
     # without building the index or touching any group, so dot-source stays clean.
     function global:Get-AutomationVariable {
         '{"groupId":"00000000-0000-0000-0000-000000000000","name":"stub-group","removeStale":false,"devices":[]}'
@@ -78,7 +78,7 @@ BeforeAll {
 }
 
 # ============================================================
-#  Log-Message — correct stream per level
+#  Log-Message: correct stream per level
 # ============================================================
 
 Describe 'Log-Message stream routing' {
@@ -100,14 +100,14 @@ Describe 'Log-Message stream routing' {
 
     It 'ERROR does not throw and does not write to Output stream' {
         # ERROR uses Write-Host (stream 6). Under $ErrorActionPreference=Stop a
-        # Write-Error here would terminate — this guards against regressing to it.
+        # Write-Error here would terminate, and this guards against regressing to it.
         $out = $null
         { $out = Log-Message -Level ERROR -Message 'bad-thing' -InvocationName 'T' } | Should -Not -Throw
         $out | Should -BeNullOrEmpty
     }
 
     It 'STATUS does not write to Output stream' {
-        # STATUS uses Write-Host (stream 6) — must not land on the pipeline.
+        # STATUS uses Write-Host (stream 6), must not land on the pipeline.
         $out = Log-Message -Level STATUS -Message 'milestone' -InvocationName 'T'
         $out | Should -BeNullOrEmpty
     }
@@ -503,7 +503,7 @@ Describe 'Resolve-Device' {
     }
 
     It 'Resolves via short-name match when full name not in exact index' {
-        # 'server01' is not an exact key (only the FQDN is) — falls to short index.
+        # 'server01' is not an exact key (only the FQDN is), so it falls to short index.
         $r = Resolve-Device -DeviceName 'server01' -ExactIndex $script:Exact -ShortIndex $script:Short
         $r.Status | Should -Be 'Resolved'
         $r.Ids[0] | Should -Be 'id-fqdn'
