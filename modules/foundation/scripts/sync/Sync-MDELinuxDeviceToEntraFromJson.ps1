@@ -73,20 +73,38 @@
 
     Text          Default. Byte-for-byte what this runbook has always emitted:
                   HH:mm:ss [InvocationName] Message, coloured on Write-Host.
-    Json          One compact OpenTelemetry log record per line (newline
-                  delimited JSON), matching LibreDevOpsHelpers.Logger so both
-                  land in a backend under one schema. Colour is dropped so no
+    Json          One compact FLAT JSON object per line (newline delimited),
+                  matching LibreDevOpsHelpers.Logger so both land in a backend
+                  under one schema. It borrows OpenTelemetry's vocabulary, the
+                  severity numbers and the semantic-convention resource keys,
+                  but it is NOT OTLP and an OTLP endpoint will not accept it.
+                  Ingesting it needs a parser stack. Colour is dropped so no
                   ANSI escape can corrupt a line something has to parse.
-    JsonIndented  Pretty-printed, for reading by eye. NOT newline delimited, so
-                  it is for local debugging and not for ingestion.
+    JsonIndented  Json, pretty-printed for reading by eye. NOT newline
+                  delimited, so it is for local debugging and not for ingestion.
+    Otlp          One complete OTLP/JSON ExportLogsServiceRequest per line,
+                  carrying exactly one record. This IS the wire format: the
+                  collector-contrib otlpjsonfile receiver reads it directly,
+                  with no json_parser, no severity_parser and no timestamp
+                  layout to get wrong. Roughly three times the bytes of Json,
+                  which is the price of needing no parser stack.
+    OtlpIndented  Otlp, pretty-printed. Same caveat as JsonIndented.
+
+    Json is still the default of the two structured formats and is the better
+    choice for Azure Automation specifically, because output reaches Log
+    Analytics through diagnostic settings and is queried with parse_json over
+    ResultDescription, where a flat object is far easier to work with. Otlp
+    earns its bytes when something is shipping these lines onward to a
+    collector.
 
     Changing the format cannot change behaviour: it only changes the string that
     each level hands to its (unchanged) stream.
 
     The end-of-run summary follows the format too. In Text it is the ASCII
-    banner it has always been. In Json it becomes one group_summary record per
-    group plus one run_summary record, carrying the same envelope as every other
-    line, so a whole run stays parseable end to end with no special cases.
+    banner it has always been. In every structured format it becomes one
+    group_summary record per group plus one run_summary record, carrying the
+    same envelope as every other line, so a whole run stays parseable end to end
+    with no special cases.
 
 .PARAMETER ManagedIdentityClientId
     Optional. Client ID of a User-Assigned Managed Identity attached to this
@@ -126,9 +144,9 @@
     HANDLING in .NOTES). Full detail in the Invoke-WithRetry docstring.
 
 .PARAMETER LogFormat
-    Text (default), Json, or JsonIndented. See LOGGING above for what each emits.
-    Resolution order is this parameter, then $env:LOG_FORMAT, then Text, the
-    same order LibreDevOpsHelpers.Logger uses.
+    Text (default), Json, JsonIndented, Otlp, or OtlpIndented. See LOGGING above
+    for what each emits. Resolution order is this parameter, then
+    $env:LOG_FORMAT, then Text, the same order LibreDevOpsHelpers.Logger uses.
 
     Unlike DefaultRemoveStale, this one IS safe to pass from a job schedule: it
     is a string, so the [bool]'false' binding trap cannot apply. That means the
@@ -141,7 +159,12 @@
     (falls back to the invocation name), SERVICE_VERSION,
     DEPLOYMENT_ENVIRONMENT, TRACE_ID, SPAN_ID, CORRELATION_ID.
     When no correlation id is supplied, the Azure Automation job id is used, so
-    every record from one hourly run shares a correlation_id out of the box.
+    every record from one hourly run shares a correlation_id out of the box. In
+    Otlp mode that job id also seeds traceId when TRACE_ID is unset, because a
+    GUID with its dashes stripped is a valid 16-byte trace id, so a run is one
+    trace with no configuration either. A TRACE_ID or SPAN_ID that is not valid
+    hex of the right width is dropped rather than emitted, since an invalid id
+    makes a collector reject the whole payload.
 
 .PARAMETER StaleRemovalMinCount / StaleRemovalMaxPercent
     Blast-radius guard for stale removal. A run that would remove MORE than
@@ -265,8 +288,9 @@ param (
     [int] $MaxRetries = 6,
     [int] $RetryDelaySeconds = 20,
 
-# Log rendering format: Text (default), Json, or JsonIndented. Text is exactly
-# what this runbook has always emitted. Deliberately NOT ValidateSet and
+# Log rendering format: Text (default), Json, JsonIndented, Otlp, or
+# OtlpIndented. Text is exactly what this runbook has always emitted, and Otlp
+# is the only one an OTLP endpoint accepts. Deliberately NOT ValidateSet and
 # deliberately silent on an unrecognised value: a typo in a schedule field must
 # fall back to Text and let the sync run, never fail the security control over a
 # logging preference. Unlike DefaultRemoveStale this IS safe to pass from a job
@@ -347,10 +371,18 @@ $script:SeverityNumbers = @{ DEBUG = 5; INFO = 9; STATUS = 9; WARN = 13; ERROR =
 # where no logging is available yet.
 $script:LogFormat = switch -Regex ("$( if ($LogFormat) { $LogFormat } else { $env:LOG_FORMAT } )".Trim().Trim('"'))
 {
+    '^(?i)otlpindented$' { 'OtlpIndented'; break }
+    '^(?i)otlp$'         { 'Otlp'; break }
     '^(?i)jsonindented$' { 'JsonIndented'; break }
     '^(?i)json$'         { 'Json'; break }
     default              { 'Text' }
 }
+
+# InstrumentationScope name for OTLP mode. This identifies the LOGGER, not the
+# service: service.name is a resource attribute and is set separately. A backend
+# uses it to tell records produced by this runbook apart from records produced by
+# any other component reporting under the same service.name.
+$script:OtlpScopeName = 'Sync-MDELinuxDeviceToEntraFromJson'
 
 # Ambient trace context, stamped onto every JSON record when set and omitted when
 # empty. Seeded from the environment so records emitted here join a trace started
@@ -379,13 +411,25 @@ if (-not $script:TraceContext.correlation_id)
     }
 }
 
-function Format-OtelLogRecord
+function Format-FlatLogRecord
 {
     <#
     .SYNOPSIS
-        Renders one log record as the OpenTelemetry-shaped JSON object used by
+        Renders one log record as the flat JSON object used by
         LibreDevOpsHelpers.Logger.
     .DESCRIPTION
+        This is the 'Json' format. It BORROWS OpenTelemetry's vocabulary without
+        being OTLP: the severity numbers are the OTel ones and the resource keys
+        are the OTel semantic conventions, but the record is one flat object, not
+        the resourceLogs/scopeLogs/logRecords envelope. Ingesting it needs a
+        parser stack (a filelog receiver with json_parser plus severity_parser,
+        or a KQL parse_json over ResultDescription); it is not something an OTLP
+        endpoint will accept. Use the 'Otlp' format for that.
+
+        The flat shape is kept because it is markedly nicer to query in Log
+        Analytics, which is where Azure Automation output actually lands, and
+        because it is what already deployed queries expect.
+
         Field order follows the OTel log data model: timestamp, level,
         severity_number, message, then service and resource attributes, then
         trace context, then any caller-supplied attributes.
@@ -451,6 +495,279 @@ function Format-OtelLogRecord
     return ($record | ConvertTo-Json -Depth 10 -Compress)
 }
 
+function Get-OtlpHexId
+{
+    <#
+    .SYNOPSIS
+        Normalises a trace or span id to OTLP's hex encoding, or returns empty.
+    .DESCRIPTION
+        OTLP/JSON encodes traceId and spanId as lowercase hex strings of a fixed
+        width, 32 characters for a trace and 16 for a span. This is a deliberate
+        departure from the proto3 JSON mapping, which would base64 a bytes field,
+        and it is stated as such in the OTLP specification. A collector rejects
+        the whole payload when the width or the alphabet is wrong, so a mistyped
+        TRACE_ID must not be allowed to reach the wire.
+
+        Returning empty rather than throwing is the point: the field is then
+        omitted, the record is still valid, and the sync still runs. A logging
+        preference must never fail a security control.
+
+        A GUID is 16 bytes, which is exactly a trace id, so an Azure Automation
+        job id becomes a valid trace id once its dashes are stripped. That is why
+        the dash strip is here and not an afterthought.
+    #>
+    param (
+        [AllowEmptyString()] [string] $Value,
+        [int] $Length
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value))
+    {
+        return ''
+    }
+
+    $candidate = $Value.Trim().Replace('-', '').ToLowerInvariant()
+
+    if ($candidate -match ('^[0-9a-f]{' + $Length + '}$'))
+    {
+        return $candidate
+    }
+
+    return ''
+}
+
+function ConvertTo-OtlpAnyValue
+{
+    <#
+    .SYNOPSIS
+        Wraps a PowerShell value in an OTLP AnyValue.
+    .DESCRIPTION
+        OTLP does not carry bare JSON values. Every attribute value is an
+        AnyValue: a single-field object naming its own type, so a backend never
+        has to guess whether 5 was an integer or a string.
+
+        Two encodings are not the obvious ones and both come from proto3's JSON
+        mapping. Sixty-four bit integers cross the wire as STRINGS, because a
+        JSON number is a double and a double cannot hold the full int64 range
+        without rounding. Doubles stay numbers.
+
+        Order of the type tests is load-bearing. A [string] is also
+        [IEnumerable], so the string test must come first or every message
+        becomes an array of characters.
+    #>
+    param ($Value)
+
+    # An AnyValue with no field set is the OTLP representation of an absent
+    # value, and is what a null must become. Emitting an empty string instead
+    # would assert that the caller reported "", which is a different fact.
+    if ($null -eq $Value)
+    {
+        return [ordered]@{}
+    }
+
+    if ($Value -is [bool])
+    {
+        return [ordered]@{ boolValue = $Value }
+    }
+
+    if ($Value -is [string])
+    {
+        return [ordered]@{ stringValue = $Value }
+    }
+
+    if ($Value -is [byte] -or $Value -is [int16] -or $Value -is [int] -or $Value -is [long])
+    {
+        return [ordered]@{ intValue = [string][long]$Value }
+    }
+
+    if ($Value -is [single] -or $Value -is [double] -or $Value -is [decimal])
+    {
+        return [ordered]@{ doubleValue = [double]$Value }
+    }
+
+    if ($Value -is [System.Collections.IDictionary])
+    {
+        $pairs = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($key in $Value.Keys)
+        {
+            $pairs.Add([ordered]@{
+                key   = [string]$key
+                value = (ConvertTo-OtlpAnyValue -Value $Value[$key])
+            })
+        }
+
+        return [ordered]@{ kvlistValue = [ordered]@{ values = $pairs } }
+    }
+
+    if ($Value -is [System.Collections.IEnumerable])
+    {
+        $items = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($item in $Value)
+        {
+            $items.Add((ConvertTo-OtlpAnyValue -Value $item))
+        }
+
+        return [ordered]@{ arrayValue = [ordered]@{ values = $items } }
+    }
+
+    return [ordered]@{ stringValue = [string]$Value }
+}
+
+function New-OtlpAttribute
+{
+    <#
+    .SYNOPSIS
+        Builds one OTLP KeyValue pair.
+    #>
+    param (
+        [string] $Key,
+        $Value
+    )
+
+    return [ordered]@{
+        key   = $Key
+        value = (ConvertTo-OtlpAnyValue -Value $Value)
+    }
+}
+
+function Format-OtlpLogRecord
+{
+    <#
+    .SYNOPSIS
+        Renders one log record as a complete OTLP/JSON ExportLogsServiceRequest.
+    .DESCRIPTION
+        This is the 'Otlp' format, and unlike 'Json' it is the real wire format.
+        Every line is a whole, self-contained export request carrying exactly one
+        record, which is precisely what the collector-contrib otlpjsonfile
+        receiver expects, so a collector can eat the output with no parser stack,
+        no severity mapping and no timestamp layout to get wrong.
+
+        One record per line is more envelope per byte than batching many records
+        into one request would be. It is still the right shape here, because a
+        runbook writes its output line by line to a host that may truncate or
+        interleave it, and a partial batch is an unparseable document whereas a
+        lost line is just a lost line.
+
+        Field placement follows the OTel log data model rather than this script's
+        convenience. service.* are RESOURCE attributes, because they describe the
+        thing emitting the telemetry. invocation and correlation_id are LOG
+        RECORD attributes, because they describe one event. The message becomes
+        body, not an attribute called message.
+
+        Encoding notes worth keeping in mind when reading the output, all of them
+        required rather than stylistic: timestamps are nanoseconds since the Unix
+        epoch as strings, severityNumber is the integer and not the enum NAME
+        that standard proto3 JSON would use, ids are hex, and every attribute
+        value is a typed AnyValue.
+
+        Every statement here either assigns or returns. Nothing may reach the
+        success stream by accident, because this function's return value IS the
+        log line.
+    #>
+    param (
+        [string]    $Level,
+        [string]    $Message,
+        [string]    $InvocationName,
+        [System.Collections.IDictionary] $Data
+    )
+
+    $serviceName = if ($env:SERVICE_NAME)
+    {
+        $env:SERVICE_NAME
+    }
+    else
+    {
+        $InvocationName
+    }
+
+    # DateTime ticks are 100ns units, so the multiply by 100 is the full
+    # precision the platform has, not a rounding up to something coarser.
+    $nanos = [string]([long](([datetime]::UtcNow - [datetime]::UnixEpoch).Ticks) * 100L)
+
+    $resourceAttributes = [System.Collections.Generic.List[object]]::new()
+    $resourceAttributes.Add((New-OtlpAttribute -Key 'service.name' -Value $serviceName))
+
+    if ($env:SERVICE_VERSION)
+    {
+        $resourceAttributes.Add((New-OtlpAttribute -Key 'service.version' -Value $env:SERVICE_VERSION))
+    }
+
+    if ($env:DEPLOYMENT_ENVIRONMENT)
+    {
+        $resourceAttributes.Add((New-OtlpAttribute -Key 'deployment.environment' -Value $env:DEPLOYMENT_ENVIRONMENT))
+    }
+
+    $logAttributes = [System.Collections.Generic.List[object]]::new()
+    $logAttributes.Add((New-OtlpAttribute -Key 'invocation' -Value $InvocationName))
+
+    # correlation_id stays an attribute even when it also seeds traceId below.
+    # The two are not interchangeable: a backend that drops invalid trace ids
+    # would otherwise lose the only thing tying one run's records together.
+    if ($script:TraceContext.correlation_id)
+    {
+        $logAttributes.Add((New-OtlpAttribute -Key 'correlation_id' -Value $script:TraceContext.correlation_id))
+    }
+
+    if ($Data)
+    {
+        foreach ($key in $Data.Keys)
+        {
+            $logAttributes.Add((New-OtlpAttribute -Key ([string]$key) -Value $Data[$key]))
+        }
+    }
+
+    $logRecord = [ordered]@{
+        timeUnixNano         = $nanos
+        observedTimeUnixNano = $nanos
+        severityNumber       = $script:SeverityNumbers[$Level]
+        severityText         = $Level
+        body                 = [ordered]@{ stringValue = $Message }
+        attributes           = $logAttributes
+    }
+
+    # An explicit TRACE_ID wins. Failing that the Automation job id is used, so a
+    # whole hourly run shares one trace id with no configuration at all. Either
+    # is dropped when it is not a valid id rather than emitted and rejected.
+    $traceId = Get-OtlpHexId -Value $script:TraceContext.trace_id -Length 32
+
+    if (-not $traceId)
+    {
+        $traceId = Get-OtlpHexId -Value $script:TraceContext.correlation_id -Length 32
+    }
+
+    $spanId = Get-OtlpHexId -Value $script:TraceContext.span_id -Length 16
+
+    if ($traceId) { $logRecord['traceId'] = $traceId }
+    if ($spanId)  { $logRecord['spanId']  = $spanId }
+
+    $payload = [ordered]@{
+        resourceLogs = @(
+            [ordered]@{
+                resource  = [ordered]@{ attributes = $resourceAttributes }
+                scopeLogs = @(
+                    [ordered]@{
+                        scope      = [ordered]@{ name = $script:OtlpScopeName }
+                        logRecords = @($logRecord)
+                    }
+                )
+            }
+        )
+    }
+
+    # Depth 20, not the 10 the flat format uses. The envelope alone is 7 levels
+    # deep before a single attribute is added, and ConvertTo-Json silently
+    # replaces anything past its depth limit with a type name string, which would
+    # produce a well-formed document that no collector can read.
+    if ($script:LogFormat -eq 'OtlpIndented')
+    {
+        return ($payload | ConvertTo-Json -Depth 20)
+    }
+
+    return ($payload | ConvertTo-Json -Depth 20 -Compress)
+}
+
 function Write-LogHostLine
 {
     <#
@@ -500,9 +817,13 @@ function Log-Message
     {
         "$( Get-Date -Format 'HH:mm:ss' ) [$InvocationName] $Message"
     }
+    elseif ($script:LogFormat -like 'Otlp*')
+    {
+        Format-OtlpLogRecord -Level $Level -Message $Message -InvocationName $InvocationName -Data $Data
+    }
     else
     {
-        Format-OtelLogRecord -Level $Level -Message $Message -InvocationName $InvocationName -Data $Data
+        Format-FlatLogRecord -Level $Level -Message $Message -InvocationName $InvocationName -Data $Data
     }
 
     switch ($Level)
@@ -1445,10 +1766,15 @@ function Write-SyncSummaryRecords
         Emits the sync summary as structured records rather than an ASCII banner.
     .DESCRIPTION
         One record per group, then one run-level record, all emitted through
-        Log-Message so they carry the same OTel envelope (timestamp, level,
-        severity_number, service.name, trace context) as every other line in the
-        job. That is the whole point: a run's summary is queryable in the same
-        index, by the same fields, as the events that produced it.
+        Log-Message so they are rendered by whichever formatter is configured and
+        carry the same envelope (timestamp, severity, service identity, trace
+        context) as every other line in the job. That is the whole point: a run's
+        summary is queryable in the same index, by the same fields, as the events
+        that produced it.
+
+        Nothing here knows which format is active. The -Data values are ordinary
+        PowerShell types and each formatter is responsible for encoding them,
+        which is why adding OTLP needed no change to this function.
 
         Records are tagged with an 'event' attribute, group_summary or
         run_summary, so a backend can select them without pattern-matching the
@@ -1513,10 +1839,10 @@ function Write-SyncSummary
     .SYNOPSIS
         Writes the end-of-run summary in whichever format is configured.
     .DESCRIPTION
-        Text renders the ASCII banner below, unchanged, and is the default. Json
-        and JsonIndented hand off to Write-SyncSummaryRecords so the summary
-        joins the newline-delimited stream instead of interrupting it with 70
-        columns of box drawing.
+        Text renders the ASCII banner below, unchanged, and is the default.
+        Every structured format hands off to Write-SyncSummaryRecords so the
+        summary joins the newline-delimited stream instead of interrupting it
+        with 70 columns of box drawing.
     #>
     param (
         [object[]] $GroupResults,
@@ -1997,8 +2323,8 @@ catch
 {
     # Top-level catch. Routed through Log-Message rather than a bare Write-Host so
     # the most important line in the whole job honours the configured format: in
-    # Json mode a raw Write-Host here would drop an unparseable line into the
-    # middle of a newline-delimited JSON stream. ERROR is still Write-Host
+    # any structured mode a raw Write-Host here would drop an unparseable line
+    # into the middle of a newline-delimited stream. ERROR is still Write-Host
     # underneath, so this stays always-visible in the portal before Azure
     # Automation marks the job Failed and the detail is lost.
     #
@@ -2009,7 +2335,8 @@ catch
                 -InvocationName 'FATAL' `
                 -Data @{ stack_trace = $_.ScriptStackTrace }
 
-    # In Json mode the stack trace is already an attribute on the record above.
+    # In a structured mode the stack trace is already an attribute on the record
+    # above, so only Text needs it printed separately.
     if ($script:LogFormat -eq 'Text')
     {
         Write-Host $_.ScriptStackTrace -ForegroundColor Red

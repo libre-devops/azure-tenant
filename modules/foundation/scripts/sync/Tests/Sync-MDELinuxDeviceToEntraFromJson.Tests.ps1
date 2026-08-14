@@ -249,6 +249,451 @@ Describe 'Log-Message rendering' {
 }
 
 # ============================================================
+#  OTLP rendering: the actual wire format, not a lookalike
+# ============================================================
+
+Describe 'Otlp rendering' {
+
+    BeforeAll {
+        # Every assertion below reaches into the same place, so name it once.
+        function global:Get-OtlpRecord
+        {
+            param ([string] $Line)
+            (($Line | ConvertFrom-Json).resourceLogs[0].scopeLogs[0].logRecords)[0]
+        }
+
+        function global:Get-OtlpAttribute
+        {
+            param ($Attributes, [string] $Key)
+
+            $match = @($Attributes | Where-Object { $_.key -eq $Key })
+            if ($match.Count -eq 0) { return $null }
+            return $match[0].value
+        }
+
+        function global:Invoke-OtlpLog
+        {
+            param (
+                [string] $Level = 'STATUS',
+                [string] $Message = 'msg',
+                [string] $InvocationName = 'T',
+                [System.Collections.IDictionary] $Data
+            )
+
+            # 6>&1 4>&1 3>&1 so one helper covers every level's stream.
+            $splat = @{ Level = $Level; Message = $Message; InvocationName = $InvocationName }
+            if ($Data) { $splat['Data'] = $Data }
+            "$(& { $VerbosePreference = 'Continue'; Log-Message @splat } 6>&1 4>&1 3>&1)"
+        }
+
+        $script:SavedTraceContext = @{
+            trace_id       = $script:TraceContext.trace_id
+            span_id        = $script:TraceContext.span_id
+            correlation_id = $script:TraceContext.correlation_id
+        }
+    }
+
+    AfterEach {
+        $script:LogFormat = 'Text'
+        $script:TraceContext.trace_id       = $script:SavedTraceContext.trace_id
+        $script:TraceContext.span_id        = $script:SavedTraceContext.span_id
+        $script:TraceContext.correlation_id = $script:SavedTraceContext.correlation_id
+    }
+
+    Context 'Envelope' {
+
+        It 'Emits one complete ExportLogsServiceRequest per line' {
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog
+
+            { $line | ConvertFrom-Json } | Should -Not -Throw
+            $line | Should -Not -Match "`n"
+
+            $doc = $line | ConvertFrom-Json
+            @($doc.resourceLogs).Count                          | Should -Be 1
+            @($doc.resourceLogs[0].scopeLogs).Count             | Should -Be 1
+            @($doc.resourceLogs[0].scopeLogs[0].logRecords).Count | Should -Be 1
+        }
+
+        It 'Names the instrumentation scope, not the service' {
+            # scope identifies the logger. The service is a resource attribute,
+            # and conflating the two is the usual way this gets built wrong.
+            $script:LogFormat = 'Otlp'
+            $doc = Invoke-OtlpLog | ConvertFrom-Json
+            $doc.resourceLogs[0].scopeLogs[0].scope.name | Should -Be 'Sync-MDELinuxDeviceToEntraFromJson'
+        }
+
+        It 'Puts service identity on the RESOURCE and never on the record' {
+            $script:LogFormat = 'Otlp'
+            $doc = Invoke-OtlpLog -InvocationName 'MyFunc' | ConvertFrom-Json
+
+            $resource = $doc.resourceLogs[0].resource
+            (Get-OtlpAttribute -Attributes $resource.attributes -Key 'service.name').stringValue | Should -Be 'MyFunc'
+
+            $record = $doc.resourceLogs[0].scopeLogs[0].logRecords[0]
+            Get-OtlpAttribute -Attributes $record.attributes -Key 'service.name' | Should -BeNullOrEmpty
+        }
+
+        It 'Puts the message in body, not in an attribute called message' {
+            $script:LogFormat = 'Otlp'
+            $record = Get-OtlpRecord -Line (Invoke-OtlpLog -Message 'Sync started')
+
+            $record.body.stringValue | Should -Be 'Sync started'
+            Get-OtlpAttribute -Attributes $record.attributes -Key 'message' | Should -BeNullOrEmpty
+        }
+
+        It 'Keeps invocation as a log record attribute' {
+            $script:LogFormat = 'Otlp'
+            $record = Get-OtlpRecord -Line (Invoke-OtlpLog -InvocationName 'Resolve-Device')
+            (Get-OtlpAttribute -Attributes $record.attributes -Key 'invocation').stringValue | Should -Be 'Resolve-Device'
+        }
+    }
+
+    Context 'Wire encoding' {
+
+        # These assertions are on the RAW line on purpose. ConvertFrom-Json
+        # coerces types on the way in, so a parsed value cannot tell you whether
+        # the wire had a string or a number, and that distinction is the entire
+        # difference between valid and invalid OTLP here.
+
+        It 'Encodes timestamps as nanosecond STRINGS, not numbers' {
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog
+
+            $line | Should -Match '"timeUnixNano":"\d{19}"'
+            $line | Should -Match '"observedTimeUnixNano":"\d{19}"'
+        }
+
+        It 'Emits timeUnixNano and observedTimeUnixNano as the same instant' {
+            $script:LogFormat = 'Otlp'
+            $record = Get-OtlpRecord -Line (Invoke-OtlpLog)
+            $record.observedTimeUnixNano | Should -Be $record.timeUnixNano
+        }
+
+        It 'Encodes severityNumber as an INTEGER, not the proto3 enum name' {
+            # Stock proto3 JSON would write SEVERITY_NUMBER_INFO. OTLP's JSON
+            # encoding overrides that and requires the integer.
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog -Level INFO
+
+            $line | Should -Match '"severityNumber":9'
+            $line | Should -Not -Match 'SEVERITY_NUMBER'
+        }
+
+        It 'Maps every level to its OTel severity number and keeps its own name' -TestCases @(
+            @{ Level = 'DEBUG';  Number = 5 }
+            @{ Level = 'INFO';   Number = 9 }
+            @{ Level = 'STATUS'; Number = 9 }
+            @{ Level = 'WARN';   Number = 13 }
+            @{ Level = 'ERROR';  Number = 17 }
+        ) {
+            $script:LogFormat = 'Otlp'
+            $record = Get-OtlpRecord -Line (Invoke-OtlpLog -Level $Level)
+
+            $record.severityNumber | Should -Be $Number
+            $record.severityText   | Should -Be $Level
+        }
+
+        It 'Encodes an integer attribute as intValue, as a STRING' {
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog -Data ([ordered]@{ added_count = 2 })
+            $line | Should -Match '"key":"added_count","value":\{"intValue":"2"\}'
+        }
+
+        It 'Encodes a boolean attribute as boolValue, unquoted' {
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog -Data ([ordered]@{ failed = $false })
+            $line | Should -Match '"key":"failed","value":\{"boolValue":false\}'
+        }
+
+        It 'Encodes a double as doubleValue, still a number' {
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog -Data ([ordered]@{ ratio = 0.25 })
+            $line | Should -Match '"key":"ratio","value":\{"doubleValue":0\.25\}'
+        }
+
+        It 'Encodes a string attribute as stringValue' {
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog -Data ([ordered]@{ event = 'run_summary' })
+            $line | Should -Match '"key":"event","value":\{"stringValue":"run_summary"\}'
+        }
+
+        It 'Encodes a null attribute as an empty AnyValue, not an empty string' {
+            # An unset AnyValue means "no value". "" would assert the caller
+            # reported an empty string, which is a different fact.
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog -Data ([ordered]@{ nothing = $null })
+            $line | Should -Match '"key":"nothing","value":\{\}'
+        }
+    }
+
+    Context 'Nested attribute values' {
+
+        It 'Encodes a string array as arrayValue' {
+            $script:LogFormat = 'Otlp'
+            $record = Get-OtlpRecord -Line (Invoke-OtlpLog -Data ([ordered]@{ pending = @('host-a', 'host-b') }))
+            $value = Get-OtlpAttribute -Attributes $record.attributes -Key 'pending'
+
+            @($value.arrayValue.values).Count         | Should -Be 2
+            $value.arrayValue.values[0].stringValue   | Should -Be 'host-a'
+        }
+
+        It 'Keeps a ONE element array an array' {
+            # Same unrolling trap the flat format has, and it lands in the same
+            # place: a backend rejecting a field that is sometimes an object.
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog -Data ([ordered]@{ pending = @('only-host') })
+            $line | Should -Match '"key":"pending","value":\{"arrayValue":\{"values":\['
+        }
+
+        It 'Encodes an empty array as an empty arrayValue' {
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog -Data ([ordered]@{ removed = @() })
+            $line | Should -Match '"key":"removed","value":\{"arrayValue":\{"values":\[\]\}\}'
+        }
+
+        It 'Encodes a dictionary as kvlistValue' {
+            $script:LogFormat = 'Otlp'
+            $record = Get-OtlpRecord -Line (Invoke-OtlpLog -Data ([ordered]@{
+                device = [ordered]@{ id = 'dev-a'; display_name = 'srv01' }
+            }))
+            $value = Get-OtlpAttribute -Attributes $record.attributes -Key 'device'
+
+            @($value.kvlistValue.values).Count       | Should -Be 2
+            $value.kvlistValue.values[0].key         | Should -Be 'id'
+            $value.kvlistValue.values[0].value.stringValue | Should -Be 'dev-a'
+        }
+
+        It 'Survives the envelope depth plus a nested list of dictionaries' {
+            # ConvertTo-Json past its -Depth does not fail, it substitutes the
+            # TYPE NAME as a string, producing a well formed document no
+            # collector can read. The envelope alone is 7 levels before any
+            # attribute, so this is the case that would catch too small a depth.
+            $script:LogFormat = 'Otlp'
+            $line = Invoke-OtlpLog -Data ([ordered]@{
+                device_members = @(
+                    [ordered]@{ id = 'dev-a'; display_name = 'srv01'; tags = @('linux', 'prd') }
+                )
+            })
+
+            $line | Should -Not -Match 'System\.Collections'
+            $record = Get-OtlpRecord -Line $line
+            $value = Get-OtlpAttribute -Attributes $record.attributes -Key 'device_members'
+            $value.arrayValue.values[0].kvlistValue.values[2].value.arrayValue.values[1].stringValue | Should -Be 'prd'
+        }
+    }
+
+    Context 'Trace context' {
+
+        It 'Derives traceId from the correlation id when TRACE_ID is unset' {
+            # A GUID is 16 bytes, which is exactly a trace id. This is what makes
+            # one Automation job one trace with no configuration at all.
+            $script:LogFormat = 'Otlp'
+            $script:TraceContext.trace_id       = ''
+            $script:TraceContext.correlation_id = 'A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D'
+
+            $record = Get-OtlpRecord -Line (Invoke-OtlpLog)
+            $record.traceId | Should -Be 'a1b2c3d4e5f64a5b8c9d0e1f2a3b4c5d'
+        }
+
+        It 'Prefers an explicit TRACE_ID over the correlation id' {
+            $script:LogFormat = 'Otlp'
+            $script:TraceContext.trace_id       = '4bf92f3577b34da6a3ce929d0e0e4736'
+            $script:TraceContext.correlation_id = 'a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d'
+
+            (Get-OtlpRecord -Line (Invoke-OtlpLog)).traceId | Should -Be '4bf92f3577b34da6a3ce929d0e0e4736'
+        }
+
+        It 'Keeps correlation_id as an attribute even once it seeds traceId' {
+            # A backend that drops trace ids it does not like must not thereby
+            # lose the only field tying one run's records together.
+            $script:LogFormat = 'Otlp'
+            $script:TraceContext.correlation_id = 'a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d'
+
+            $record = Get-OtlpRecord -Line (Invoke-OtlpLog)
+            (Get-OtlpAttribute -Attributes $record.attributes -Key 'correlation_id').stringValue |
+                Should -Be 'a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d'
+        }
+
+        It 'Drops an invalid trace or span id rather than emitting it' -TestCases @(
+            @{ TraceId = 'not-hex-at-all';                     SpanId = '' }
+            @{ TraceId = 'deadbeef';                           SpanId = '' }
+            @{ TraceId = '4bf92f3577b34da6a3ce929d0e0e4736ff'; SpanId = '' }
+            @{ TraceId = '';                                   SpanId = 'zzzzzzzzzzzzzzzz' }
+            @{ TraceId = '';                                   SpanId = '00f067aa0ba902' }
+        ) {
+            # An invalid id makes a collector reject the WHOLE payload, so the
+            # only safe thing is to omit the field and keep the record valid.
+            $script:LogFormat = 'Otlp'
+            $script:TraceContext.trace_id       = $TraceId
+            $script:TraceContext.span_id        = $SpanId
+            $script:TraceContext.correlation_id = ''
+
+            $line = Invoke-OtlpLog
+            if ($TraceId) { $line | Should -Not -Match '"traceId"' }
+            if ($SpanId)  { $line | Should -Not -Match '"spanId"' }
+        }
+
+        It 'Emits a valid span id when SPAN_ID is set' {
+            $script:LogFormat = 'Otlp'
+            $script:TraceContext.span_id = '00F067AA0BA902B7'
+            (Get-OtlpRecord -Line (Invoke-OtlpLog)).spanId | Should -Be '00f067aa0ba902b7'
+        }
+
+        It 'Omits spanId entirely when there is none' {
+            $script:LogFormat = 'Otlp'
+            $script:TraceContext.span_id = ''
+            Invoke-OtlpLog | Should -Not -Match '"spanId"'
+        }
+    }
+
+    Context 'Behaviour is unchanged by the format' {
+
+        It 'Routes each level to the SAME stream as Text does' {
+            # The hard constraint from the Text and Json formats carries over.
+            # ERROR on Write-Error would terminate under -EAP Stop.
+            $script:LogFormat = 'Otlp'
+
+            (& { $VerbosePreference = 'Continue'; Log-Message -Level INFO -Message 'm' -InvocationName 'T' } 4>&1) | Should -Not -BeNullOrEmpty
+            (& { Log-Message -Level WARN   -Message 'm' -InvocationName 'T' } 3>&1)                                | Should -Not -BeNullOrEmpty
+            (& { Log-Message -Level STATUS -Message 'm' -InvocationName 'T' } 6>&1)                                | Should -Not -BeNullOrEmpty
+            (& { Log-Message -Level ERROR  -Message 'm' -InvocationName 'T' } 6>&1)                                | Should -Not -BeNullOrEmpty
+
+            $out = Log-Message -Level STATUS -Message 'm' -InvocationName 'T'
+            $out | Should -BeNullOrEmpty
+        }
+
+        It 'Never throws on ERROR' {
+            $script:LogFormat = 'Otlp'
+            { Log-Message -Level ERROR -Message 'bad' -InvocationName 'T' } | Should -Not -Throw
+        }
+
+        It 'OtlpIndented is multi-line and still parses' {
+            $script:LogFormat = 'OtlpIndented'
+            $out = & { $VerbosePreference = 'Continue'; Log-Message -Level INFO -Message 'x' -InvocationName 'T' } 4>&1
+            (Get-OtlpRecord -Line "$out").body.stringValue | Should -Be 'x'
+        }
+
+        It 'Leaves the flat Json format untouched' {
+            # Otlp is an ADDITION. Anything already reading the flat records must
+            # see exactly what it saw before.
+            $script:LogFormat = 'Json'
+            $record = "$(Invoke-OtlpLog -Level INFO -Message 'hello' -InvocationName 'MyFunc')" | ConvertFrom-Json
+
+            $record.severity_number | Should -Be 9
+            $record.message         | Should -Be 'hello'
+            $record.'service.name'  | Should -Be 'MyFunc'
+            $record.PSObject.Properties['resourceLogs'] | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Format resolution' {
+
+        It 'Resolves the format name from LOG_FORMAT' -TestCases @(
+            @{ Value = 'otlp';          Expected = 'Otlp' }
+            @{ Value = 'OTLP';          Expected = 'Otlp' }
+            @{ Value = ' Otlp ';        Expected = 'Otlp' }
+            @{ Value = 'otlpindented';  Expected = 'OtlpIndented' }
+            @{ Value = 'json';          Expected = 'Json' }
+            @{ Value = 'nonsense';      Expected = 'Text' }
+            @{ Value = '';              Expected = 'Text' }
+        ) {
+            # Dot-sources a second time, because resolution happens once at
+            # script scope. The stub Get-AutomationVariable returns a config with
+            # no devices, so MAIN warns and returns without touching anything.
+            $saved = $env:LOG_FORMAT
+            try
+            {
+                $env:LOG_FORMAT = $Value
+                . "$PSScriptRoot/../Sync-MDELinuxDeviceToEntraFromJson.ps1" -AutomationVariableNames 'GroupConfig-stub' *> $null
+                $script:LogFormat | Should -Be $Expected
+            }
+            finally
+            {
+                $env:LOG_FORMAT = $saved
+            }
+        }
+    }
+}
+
+# ============================================================
+#  Get-OtlpHexId / ConvertTo-OtlpAnyValue
+# ============================================================
+
+Describe 'Get-OtlpHexId' {
+
+    It 'Accepts a 32 character trace id' {
+        Get-OtlpHexId -Value '4bf92f3577b34da6a3ce929d0e0e4736' -Length 32 | Should -Be '4bf92f3577b34da6a3ce929d0e0e4736'
+    }
+
+    It 'Lowercases and strips dashes so a GUID becomes a trace id' {
+        Get-OtlpHexId -Value '  A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D  ' -Length 32 | Should -Be 'a1b2c3d4e5f64a5b8c9d0e1f2a3b4c5d'
+    }
+
+    It 'Returns empty for the wrong width' {
+        Get-OtlpHexId -Value 'deadbeef' -Length 32 | Should -BeNullOrEmpty
+    }
+
+    It 'Returns empty for a non-hex character' {
+        Get-OtlpHexId -Value '4bf92f3577b34da6a3ce929d0e0e473g' -Length 32 | Should -BeNullOrEmpty
+    }
+
+    It 'Returns empty rather than throwing on blank input' {
+        # Called on every record, so this path is hot and must never throw.
+        { Get-OtlpHexId -Value '' -Length 32 } | Should -Not -Throw
+        Get-OtlpHexId -Value '   ' -Length 16  | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'ConvertTo-OtlpAnyValue' {
+
+    It 'Treats a string as a string and not as a character sequence' {
+        # A [string] is also [IEnumerable]. Test it in the wrong order and every
+        # message becomes an array of single character values.
+        $value = ConvertTo-OtlpAnyValue -Value 'srv01'
+        $value.Keys | Should -Be 'stringValue'
+        $value['stringValue'] | Should -Be 'srv01'
+    }
+
+    It 'Distinguishes a bool from an int' {
+        (ConvertTo-OtlpAnyValue -Value $true).Keys  | Should -Be 'boolValue'
+        (ConvertTo-OtlpAnyValue -Value 1).Keys      | Should -Be 'intValue'
+    }
+
+    It 'Widens every integer type to intValue' -TestCases @(
+        @{ Value = [byte]1 }
+        @{ Value = [int16]2 }
+        @{ Value = [int]3 }
+        @{ Value = [long]4 }
+    ) {
+        $result = ConvertTo-OtlpAnyValue -Value $Value
+        $result.Keys            | Should -Be 'intValue'
+        $result['intValue']     | Should -BeOfType [string]
+    }
+
+    It 'Keeps floating point types as doubleValue numbers' -TestCases @(
+        @{ Value = [single]1.5 }
+        @{ Value = [double]1.5 }
+        @{ Value = [decimal]1.5 }
+    ) {
+        $result = ConvertTo-OtlpAnyValue -Value $Value
+        $result.Keys            | Should -Be 'doubleValue'
+        $result['doubleValue']  | Should -Be 1.5
+    }
+
+    It 'Falls back to stringValue for a type it does not model' {
+        $result = ConvertTo-OtlpAnyValue -Value ([guid]'a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d')
+        $result.Keys            | Should -Be 'stringValue'
+        $result['stringValue']  | Should -Be 'a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d'
+    }
+
+    It 'Recurses through a dictionary inside an array' {
+        $result = ConvertTo-OtlpAnyValue -Value @(@{ id = 'dev-a' })
+        $result['arrayValue']['values'][0]['kvlistValue']['values'][0]['key'] | Should -Be 'id'
+    }
+}
+
+# ============================================================
 #  Write-SyncSummary: banner in Text, records in Json
 # ============================================================
 
@@ -359,6 +804,32 @@ Describe 'Write-SyncSummary' {
 
         $run.failed_groups | Should -Be 1
         $run.total_errors  | Should -Be 1
+    }
+
+    It 'Otlp emits the same two records, as OTLP payloads' {
+        # Write-SyncSummaryRecords knows nothing about formats. This proves it,
+        # by getting the identical record set through a different renderer.
+        $script:LogFormat = 'Otlp'
+        $lines = @(Write-SyncSummary -GroupResults $script:OneGroup -TotalErrors 0 6>&1 | ForEach-Object { "$_" })
+
+        $records = @($lines | ForEach-Object { (($_ | ConvertFrom-Json).resourceLogs[0].scopeLogs[0].logRecords)[0] })
+        $events  = @($records | ForEach-Object {
+            @($_.attributes | Where-Object { $_.key -eq 'event' })[0].value.stringValue
+        })
+
+        @($events | Where-Object { $_ -eq 'group_summary' }).Count | Should -Be 1
+        @($events | Where-Object { $_ -eq 'run_summary' }).Count   | Should -Be 1
+    }
+
+    It 'Otlp encodes the summary counts as typed AnyValues' {
+        $script:LogFormat = 'Otlp'
+        $lines = @(Write-SyncSummary -GroupResults $script:OneGroup -TotalErrors 0 6>&1 | ForEach-Object { "$_" })
+        $raw = @($lines | Where-Object { $_ -match '"stringValue":"group_summary"' })[0]
+
+        $raw | Should -Match '"key":"added_count","value":\{"intValue":"1"\}'
+        $raw | Should -Match '"key":"failed","value":\{"boolValue":false\}'
+        $raw | Should -Match '"key":"removed","value":\{"arrayValue":\{"values":\[\]\}\}'
+        $raw | Should -Match '"key":"added","value":\{"arrayValue":\{"values":\[\{"kvlistValue"'
     }
 }
 
